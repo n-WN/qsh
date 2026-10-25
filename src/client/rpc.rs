@@ -33,6 +33,8 @@ pub struct Policy {
     pub receive: bool,
     /// Remote reads of local files that the user did not pick.
     pub read_paths: Consent,
+    /// Upload files that are dropped into the terminal.
+    pub drop: bool,
 }
 
 pub async fn serve(sh: Arc<Shared>, mut s: quinn::SendStream, mut r: quinn::RecvStream) {

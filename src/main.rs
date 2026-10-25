@@ -7,6 +7,7 @@ mod proto;
 mod server;
 mod tls;
 mod tools;
+mod vt;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -74,6 +75,9 @@ struct ConnectArgs {
     /// Do not copy OSC 52 clipboard writes into the local clipboard.
     #[arg(long)]
     no_osc52: bool,
+    /// Paste dropped files as text paths (do not upload them).
+    #[arg(long)]
+    no_drop: bool,
     /// Tell which network path the connection uses.
     #[arg(short, long)]
     verbose: bool,
@@ -307,6 +311,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 clipboard: !c.no_clipboard,
                 open: !c.no_open,
                 receive: !c.no_receive,
+                drop: !c.no_drop,
                 read_paths: match c.read_paths {
                     AskArg::Ask => client::rpc::Consent::Ask,
                     AskArg::Always => client::rpc::Consent::Always,

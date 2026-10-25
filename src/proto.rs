@@ -117,6 +117,10 @@ pub struct Hello {
     /// Make a new session with a free name (ignores `session`).
     #[serde(default)]
     pub new: bool,
+    /// The client screen is blank with the cursor at the top left: a snapshot
+    /// need not scroll old text away.
+    #[serde(default)]
+    pub clean: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

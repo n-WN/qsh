@@ -55,7 +55,8 @@ pub struct Daemon {
 
 enum Start {
     Offset(u64),
-    Snapshot(bool),
+    /// history: send the scrollback; clean: the client screen is blank.
+    Snapshot { history: bool, clean: bool },
 }
 
 /// State of one QUIC connection.
@@ -124,6 +125,9 @@ pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
             });
         }
     });
+
+    // Dropped files are for the moment: remove them after a week.
+    tokio::task::spawn_blocking(|| clean_drops(Duration::from_secs(7 * 24 * 3600)));
 
     let di = d.clone();
     let sp = sock_path.clone();
@@ -207,6 +211,17 @@ fn valid_name(s: &str) -> bool {
 
 fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn clean_drops(age: Duration) {
+    let dir = crate::paths::home().join(".qsh/drop");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    for e in rd.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() > age);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 impl Daemon {
@@ -320,10 +335,17 @@ impl Daemon {
             }
             Rpc::Push { dest, .. } => {
                 let target = resolve(&cwd, &dest);
-                let place = if target.is_dir() { files::Place::Into(target) } else { files::Place::As(target) };
+                // "dir/": a new folder (drag and drop). It goes away if the transfer fails.
+                let created = dest.ends_with('/') && !target.exists() && tokio::fs::create_dir_all(&target).await.is_ok();
+                let place = if target.is_dir() { files::Place::Into(target.clone()) } else { files::Place::As(target.clone()) };
                 let rep = match files::read_archive(&mut r, place).await {
                     Ok(saved) => Reply { ok: true, saved: saved.iter().map(|p| p.display().to_string()).collect(), ..Default::default() },
-                    Err(e) => Reply::err(format!("{e:#}")),
+                    Err(e) => {
+                        if created {
+                            let _ = tokio::fs::remove_dir_all(&target).await;
+                        }
+                        Reply::err(format!("{e:#}"))
+                    }
                 };
                 proto::write_msg(&mut s, &rep).await?;
             }
@@ -496,16 +518,23 @@ impl Daemon {
                 ack_at: Instant::now(),
             },
         );
+        let before = st.size;
         if !readonly {
             sess.activate(&mut st, id);
         }
+        // A full-screen program redraws on a size change. With no size change,
+        // make it redraw anyway.
+        let nudge = !created && st.size == before && st.mirror.alt_screen();
         drop(st);
+        if nudge {
+            sess.nudge();
+        }
         Ok(Attached {
             session: sess,
             id,
             epoch: 1,
             owner,
-            start: if created { Start::Offset(0) } else { Start::Snapshot(true) },
+            start: if created { Start::Offset(0) } else { Start::Snapshot { history: true, clean: h.clean } },
             welcome: Welcome { ok: true, client_id: id, resume_token: token, session: name, created, readonly, ..Default::default() },
         })
     }
@@ -637,7 +666,7 @@ async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch
     let mut exit_rx = sess.exit.subscribe();
     let (mut off, mut snap) = match start {
         Start::Offset(o) => (o, None),
-        Start::Snapshot(full) => (0, Some(full)),
+        Start::Snapshot { history, clean } => (0, Some((history, clean))),
     };
     loop {
         head_rx.borrow_and_update();
@@ -650,12 +679,12 @@ async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch
                 _ => return,
             };
             let head = st.ring.head();
-            if let Some(full) = snap.take() {
-                let b = st.snapshot(full);
+            if let Some((history, clean)) = snap.take() {
+                let b = st.mirror.snapshot(history, clean);
                 off = head;
                 Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
             } else if off < st.ring.base() || off > head || head - off > LAG_LIMIT {
-                let b = st.snapshot(false);
+                let b = st.mirror.snapshot(false, false);
                 off = head;
                 Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
             } else if off < head {

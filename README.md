@@ -6,12 +6,12 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 | Need | qsh |
 |---|---|
 | Network changes (Wi-Fi to LTE, sleep, new IP) | QUIC connection migration, plus lossless resume on a new connection |
-| UDP blocked | QUIC datagrams go through the SSH channel; qsh moves back to UDP when UDP works again |
+| UDP blocked | QUIC over UDP and QUIC through the SSH channel race; no timeout to wait for. qsh moves back to UDP when UDP works again |
 | Full modern VT | Raw byte stream to your own terminal: truecolor, OSC 8, kitty keyboard, synchronized output, your `TERM` (terminfo is compiled on the server if it is missing) |
-| Scrollback | Native scrollback, selection and scrolling of your terminal. On reattach, the history comes back |
+| Scrollback | Native scrollback, selection and scrolling of your terminal. On reattach, the history comes back with all attributes, links and soft wraps |
 | Kitty graphics protocol | Works (`kitten icat`, yazi, timg). The pixel size of the window is forwarded |
 | Clipboard | Both directions, any data type. `xclip`, `xsel`, `wl-copy`, `wl-paste`, `pbcopy`, `pbpaste` on the server use your local clipboard. The commands that Claude Code runs on Ctrl-V return the local image |
-| Files without scp | `qsh send` / `qsh get` in the session, `qsh cp` on your machine, all on the open connection |
+| Files without scp | Drop files into the terminal: they go to the server and the remote paths are pasted. `qsh send` / `qsh get` in the session, `qsh cp` on your machine, all on the open connection |
 | Multiplexer | Sessions live on the server. Detach, reattach from another device, many sessions per client, live sharing |
 
 ## How it works
@@ -19,32 +19,63 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 ```
  your terminal ── qsh client ══ QUIC (UDP, or UDP-in-SSH) ══ qsh daemon ── pty ── shell
                      │                                          │
-                     └── local clipboard, files, open URL       ├── ring buffer of output (8 MB, byte offsets)
-                                                                ├── vt100 mirror of the screen (snapshots)
+                     ├── local clipboard, files, open URL       ├── ring buffer of output (8 MB, byte offsets)
+                     └── mirror of the screen (overlay)         ├── mirror of the screen (snapshots)
                                                                 └── unix socket ── qsh tools / xclip shims
 ```
 
 1. `qsh host` runs `ssh host qsh helper`. The helper starts the per-user daemon if
    necessary and prints the UDP port, the SHA-256 of the daemon certificate and a
    one-time token. SSH does the authentication, as with mosh.
-2. The client connects with QUIC and pins the certificate. If no UDP path exists
-   in 2.5 s, the same SSH process becomes a datagram pipe for QUIC.
+2. The client connects with QUIC and pins the certificate. QUIC over UDP and
+   QUIC through the same SSH process (a datagram pipe) start at the same time.
+   The first that works wins; UDP gets 150 ms more when the tunnel is first.
 3. The server sends the pty output as raw bytes with absolute offsets. Your own
    terminal does all the VT work. The client acknowledges offsets.
 4. On a new connection the client sends its offset; the server replays the
    missing bytes from the ring buffer. If the bytes are gone (or the client is
-   new), the server sends a snapshot from its vt100 mirror instead: scrollback,
-   screen, cursor, modes, kitty keyboard flags and title.
+   new), the server sends a snapshot from its mirror of the screen instead.
+
+### Snapshots
+
+The mirror is an `alacritty_terminal` grid that gets the same bytes as your
+terminal. qsh turns it back into escape sequences (`src/vt.rs`):
+
+- scrollback (10,000 lines) and screen, with soft wraps, so that your terminal
+  reflows the lines on resize as if it had received the original output
+- all SGR attributes: truecolor and 256 colors, underline styles (`4:3` curly
+  and others), underline color (`58`), strikeout, dim, italic, inverse, hidden
+- OSC 8 hyperlinks, wide (CJK, emoji) and combining characters
+- cursor position (also the pending-wrap state), shape, visibility and pen
+- the alternate screen and, under it, the main screen with its history
+- modes: application keys, mouse, bracketed paste, focus events, kitty
+  keyboard flags, wrap, insert, the palette (OSC 4/10/11/12) and the title
+
+When you attach, the lines above the cursor go into your terminal's scrollback,
+and the session starts on a blank screen. Nothing is drawn twice. A full-screen
+program (vim, htop) also gets a SIGWINCH, so it redraws itself at once.
 
 ### Roaming and liveness
 
 - Every second the client sends a QUIC datagram; the server echoes it. After
   3 s without an echo the client moves to a new UDP socket (new NAT mapping,
-  new interface). After 8 s it makes a new connection (UDP first, then the SSH
-  tunnel) and resumes at its offset. No output is lost or shown twice.
+  new interface), and at the same time races a new connection (UDP and the SSH
+  tunnel). The first path that works continues the session at its offset. No
+  output is lost or shown twice. After 10 s the client tries again and again.
 - On the SSH tunnel, the client tests UDP every 30 s and moves the live
   connection back to UDP when it works.
 - A suspended laptop resumes in about 0.2 s after wake-up.
+
+### Status overlay
+
+After 2.5 s without an echo, a badge (`qsh ↻ no reply from the server`) shows
+at the top right; when the connection is back, the badge goes away and the
+cells under it come back exactly. The overlay is not part of the session: the
+client keeps its own mirror of the screen and repaints those cells from it, in
+one synchronized update. It is never put inside an escape sequence or a UTF-8
+character, it does not end a synchronized update of the program, and it
+handles insert mode and the line-drawing character set. Help, the session list
+and connection information use the same overlay.
 
 ### Flow control
 
@@ -91,7 +122,7 @@ qsh --download-dir ~/inbox host   # where `qsh send` puts files (default: ~/Down
 
 Options that limit what the server can do on your machine: `--no-clipboard`,
 `--no-receive`, `--no-open`, `--no-osc52`, `--read-paths ask|always|never`
-(see [Security](#security)).
+(see [Security](#security)). `--no-drop` pastes dropped files as local paths.
 
 Keys (the prefix is `Ctrl-^`, as in mosh):
 
@@ -102,12 +133,28 @@ Keys (the prefix is `Ctrl-^`, as in mosh):
 | `Ctrl-^ c` | new session |
 | `Ctrl-^ n` / `Ctrl-^ p` | next / previous session |
 | `Ctrl-^ 0`…`9` | select a session |
-| `Ctrl-^ w` | list sessions (in the window title) |
-| `Ctrl-^ ?` | help (in the window title) |
+| `Ctrl-^ w` | list sessions |
+| `Ctrl-^ i` | connection: path, RTT, loss, MTU |
+| `Ctrl-^ ?` | help |
 | `Ctrl-^ Ctrl-^` | send `Ctrl-^` |
 
 Each session has its own scrollback. On a switch the local scrollback is
-cleared and the target session's history comes back.
+cleared and the target session's history comes back. Panels go away when you
+type.
+
+### Drag and drop
+
+Drop files or folders from Finder (or any file manager) into the terminal. The
+terminal pastes their paths; qsh sees that every pasted word is a local file
+(under your home folder, `/Volumes`, the temporary folders or `/media`),
+sends the files to `~/.qsh/drop/<time>/` on the server and pastes the remote
+paths instead, quoted in the same style. A screenshot dropped into Claude Code
+on the server arrives as a file that it can read.
+
+The progress shows at the top right. Keys that you type during the upload wait
+and follow the paste. `Ctrl-C` stops the upload; the server removes the
+partial folder. Paths such as `/etc/hosts` stay text, because they can also
+name files on the server. The server removes dropped files after 7 days.
 
 ### Inside a session
 
@@ -188,8 +235,10 @@ another). It does not log in again. It was faster than scp in a test
 
 - Snapshots (reattach, far lag) do not contain kitty graphics images. Normal
   streaming and resume from the ring buffer keep them.
-- A snapshot brings back at most 5000 lines of history (the size of the
-  server's vt100 mirror).
+- A snapshot brings back at most 10,000 lines of history.
+- Snapshots do not contain the scroll region (DECSTBM) or origin mode;
+  full-screen programs set them again when they redraw. The overlay waits
+  while origin mode is on.
 - With two clients on one session, the pty size follows the client that
   attached or typed last. A client with a different window size sees that
   layout. Terminal replies from the other client are dropped (heuristic).
@@ -203,28 +252,36 @@ another). It does not log in again. It was faster than scp in a test
 ## Tests
 
 ```sh
-cargo test                     # ring buffer, snapshots, archive, VT scanner, kitty keys, reply filter, MIME mapping
+cargo test                     # mirror and snapshots, overlay repaint, ring buffer, archive, VT scanner, kitty keys, drop detection
 tests/e2e/kitty_graphics.py target/release/qsh host local.png remote.png --port P
 ```
 
 Manual end-to-end checks that were done against a Linux server (75 ms RTT):
 
-- 25 s of dropped inbound UDP during output: loss found at 8 s, resume through
-  the SSH tunnel, 75/75 lines in order; later the connection moved back to UDP.
-- Start with UDP blocked, then unblock: the live connection moved from the
-  SSH tunnel to UDP (QUIC migration), no reconnect.
+- 7 s of dropped inbound UDP: badge at 2.5 s, new socket at 3 s, session on a
+  new connection through the SSH tunnel at 5 s; 3 s after UDP worked again the
+  connection moved back to UDP. The cells under the badge came back exactly.
+- Start with UDP blocked: the prompt shows in 1.7 s (through the tunnel); when
+  UDP works again, the live connection moves to UDP (QUIC migration).
 - SIGSTOP of the client for 75 s: new connection in 0.17 s, 100/100 lines.
 - 200,000 lines of output: all lines in the local scrollback.
 - Image on the macOS clipboard: `xclip -t image/png -o` on the server gives
   the same bytes (MD5).
 - `kitten icat` on the server: the PNG reaches the local terminal unchanged.
-- Detach and reattach from a new terminal: screen and scrollback come back.
+- Detach and reattach from a new terminal: screen and scrollback come back,
+  with curly underline and its color, strikeout, truecolor, hyperlinks, wide
+  and combining characters. No empty lines between the old local text and the
+  session.
+- Reattach while vim runs, from a terminal of another size: vim redraws at the
+  new size; after `:q` the main screen and its history are there.
+- Drop of a 300 kB file into `md5sum `: same MD5 on the server. `Ctrl-C`
+  during a 60 MB drop: the upload stops, the partial folder is removed.
 - Ctrl-C during an output flood: the prompt comes back in about 0.5 s.
 - Session switch with `Ctrl-^ c` / `Ctrl-^ p`: each session shows only its own
   scrollback. When a session's shell exits, the client moves to another one.
 - A read-write share link: the guest can type, but `Ctrl-^ c` makes no session.
-- 6 s of dropped UDP: the window title shows `[qsh: no contact for 4s]`; the
-  remote title comes back after the outage.
+- Session switch while vim runs: the new session starts clean, and `Ctrl-^ p`
+  shows vim again.
 
 ## Source layout
 
@@ -236,12 +293,14 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
 | `src/files.rs` | streaming archive for file transfer |
 | `src/tools.rs` | tools inside a session, and the clipboard shims |
 | `src/server/daemon.rs` | QUIC listener, attach and resume, flow control, local socket |
-| `src/server/session.rs` | pty session, ring buffer, vt100 mirror, snapshots |
+| `src/vt.rs` | mirror of the screen (alacritty_terminal) and its serializer |
+| `src/server/session.rs` | pty session, ring buffer, backpressure |
 | `src/server/helper.rs` | `qsh helper` (SSH bootstrap and datagram relay) |
 | `src/server/pty.rs` | pty and child process |
-| `src/client/mod.rs` | connect, liveness, reconnect, session switch |
-| `src/client/net.rs` | SSH helper process, SSH tunnel socket, path changes |
-| `src/client/term.rs` | raw mode, keys, output thread, VT scanner |
+| `src/client/mod.rs` | connect, liveness, reconnect, session switch, overlay state |
+| `src/client/net.rs` | SSH helper process, SSH tunnel socket, path race, path changes |
+| `src/client/term.rs` | raw mode, keys, paste, output thread with overlay, VT scanner |
+| `src/client/drop.rs` | drag and drop: path detection, upload, paste rewrite |
 | `src/client/rpc.rs` | requests from the server, `qsh cp` |
 | `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |
 

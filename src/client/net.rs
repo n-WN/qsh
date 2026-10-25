@@ -282,7 +282,100 @@ pub struct Link {
     pub kind: PathKind,
     pub transport: Transport,
     pub spec: Option<SshSpec>,
+    fp: String,
     tunnel: Option<Helper>,
+}
+
+/// What a path race needs.
+#[derive(Clone)]
+pub struct RaceSpec {
+    pub addr: SocketAddr,
+    pub fp: String,
+    pub transport: Transport,
+    pub spec: Option<SshSpec>,
+}
+
+/// The winner of a path race: a connection with its endpoint.
+pub struct Candidate {
+    pub ep: quinn::Endpoint,
+    pub conn: quinn::Connection,
+    pub kind: PathKind,
+    helper: Option<Helper>,
+}
+
+fn udp_endpoint(addr: &SocketAddr, fp: &str) -> Result<quinn::Endpoint> {
+    let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(addr)?, Arc::new(quinn::TokioRuntime))?;
+    ep.set_default_client_config(crate::tls::client_config(fp)?);
+    Ok(ep)
+}
+
+fn tunnel_endpoint(h: &mut Helper, addr: &SocketAddr, fp: &str) -> Result<quinn::Endpoint> {
+    let sock = TunnelSocket::take_from(h, *addr)?;
+    let mut ep = quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), None, sock, Arc::new(quinn::TokioRuntime))?;
+    ep.set_default_client_config(crate::tls::client_config(fp)?);
+    Ok(ep)
+}
+
+async fn handshake_on(ep: quinn::Endpoint, addr: SocketAddr, timeout: Duration) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let c = ep.connect(addr, "qsh")?;
+    let conn = tokio::time::timeout(timeout, c).await.map_err(|_| anyhow!("timeout"))??;
+    Ok((ep, conn))
+}
+
+/// Make a QUIC connection on direct UDP and through the SSH channel at the same
+/// time; the first handshake wins. UDP is preferred: when the tunnel wins, UDP
+/// gets 150 ms more. `helper` is a running tunnel helper, if there is one;
+/// otherwise a new helper starts after `tunnel_delay`.
+pub async fn race(rs: RaceSpec, helper: Option<Helper>, tunnel_delay: Duration) -> Result<Candidate> {
+    let direct = async {
+        let ep = udp_endpoint(&rs.addr, &rs.fp)?;
+        let (ep, conn) = handshake_on(ep, rs.addr, Duration::from_secs(5)).await?;
+        Ok::<_, anyhow::Error>(Candidate { ep, conn, kind: PathKind::Direct, helper: None })
+    };
+    let tunnel = async {
+        let mut h = match helper {
+            Some(h) => h,
+            None => {
+                tokio::time::sleep(tunnel_delay).await;
+                let spec = rs.spec.as_ref().ok_or_else(|| anyhow!("no ssh"))?;
+                spawn_helper(spec, true, false, true).await?
+            }
+        };
+        let ep = tunnel_endpoint(&mut h, &rs.addr, &rs.fp)?;
+        let (ep, conn) = handshake_on(ep, rs.addr, Duration::from_secs(10)).await?;
+        Ok::<_, anyhow::Error>(Candidate { ep, conn, kind: PathKind::Tunnel, helper: Some(h) })
+    };
+    match rs.transport {
+        Transport::Udp => direct.await,
+        Transport::Ssh => tunnel.await,
+        Transport::Auto => {
+            tokio::pin!(direct, tunnel);
+            let (mut derr, mut terr) = (None, None);
+            loop {
+                tokio::select! {
+                    r = &mut direct, if derr.is_none() => match r {
+                        Ok(c) => return Ok(c),
+                        Err(e) => derr = Some(e),
+                    },
+                    r = &mut tunnel, if terr.is_none() => match r {
+                        Ok(c) => {
+                            // UDP is better: give it a moment to win.
+                            if derr.is_none()
+                                && let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(150), &mut direct).await
+                            {
+                                return Ok(d);
+                            }
+                            return Ok(c);
+                        }
+                        Err(e) => terr = Some(e),
+                    },
+                }
+                if let (Some(d), Some(t)) = (&derr, &terr) {
+                    bail!("no path to the server (UDP: {d:#}; SSH: {t:#})");
+                }
+            }
+        }
+    }
 }
 
 fn bind_any(addr: &SocketAddr) -> std::io::Result<std::net::UdpSocket> {
@@ -291,9 +384,27 @@ fn bind_any(addr: &SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 
 impl Link {
     pub fn new(addr: SocketAddr, fp: &str, transport: Transport, spec: Option<SshSpec>) -> Result<Link> {
-        let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(&addr)?, Arc::new(quinn::TokioRuntime))?;
-        ep.set_default_client_config(crate::tls::client_config(fp)?);
-        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, tunnel: None })
+        let ep = udp_endpoint(&addr, fp)?;
+        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, fp: fp.to_string(), tunnel: None })
+    }
+
+    /// Use the connection of a race winner (and its endpoint and tunnel).
+    pub fn adopt(&mut self, c: Candidate) -> quinn::Connection {
+        self.ep = c.ep;
+        self.kind = c.kind;
+        self.tunnel = c.helper;
+        c.conn
+    }
+
+    pub fn race_spec(&self) -> RaceSpec {
+        RaceSpec { addr: self.addr, fp: self.fp.clone(), transport: self.transport, spec: self.spec.clone() }
+    }
+
+    pub fn path_name(&self) -> String {
+        match self.kind {
+            PathKind::Direct => format!("UDP {}", self.addr),
+            PathKind::Tunnel => "QUIC in SSH".to_string(),
+        }
     }
 
     /// Move to a new UDP socket (new port, new NAT mapping, current interface).

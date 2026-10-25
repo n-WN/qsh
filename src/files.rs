@@ -182,11 +182,10 @@ pub async fn read_archive<R: AsyncRead + Unpin>(r: &mut R, place: Place) -> Resu
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                if let Ok(m) = std::fs::symlink_metadata(&path) {
-                    if m.file_type().is_symlink() {
+                if let Ok(m) = std::fs::symlink_metadata(&path)
+                    && m.file_type().is_symlink() {
                         tokio::fs::remove_file(&path).await?;
                     }
-                }
                 let mut opts = tokio::fs::OpenOptions::new();
                 opts.write(true).create(true).truncate(true).custom_flags(libc::O_NOFOLLOW);
                 opts.mode(if e.mode != 0 { e.mode & 0o777 } else { 0o644 });

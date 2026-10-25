@@ -20,7 +20,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ask {
+pub enum Consent {
     Ask,
     Always,
     Never,
@@ -32,17 +32,16 @@ pub struct Policy {
     pub open: bool,
     pub receive: bool,
     /// Remote reads of local files that the user did not pick.
-    pub read_paths: Ask,
+    pub read_paths: Consent,
 }
 
 pub async fn serve(sh: Arc<Shared>, mut s: quinn::SendStream, mut r: quinn::RecvStream) {
     let mut header_sent = false;
     let res = handle(&sh, &mut s, &mut r, &mut header_sent).await;
-    if let Err(e) = res {
-        if !header_sent {
+    if let Err(e) = res
+        && !header_sent {
             let _ = proto::write_msg(&mut s, &Reply::err(format!("{e:#}"))).await;
         }
-    }
     let _ = s.finish();
 }
 
@@ -81,11 +80,10 @@ async fn handle(sh: &Arc<Shared>, s: &mut quinn::SendStream, r: &mut quinn::Recv
             }
             crate::paths::ensure_dir(&sh.download_dir).ok();
             let saved = files::read_archive(r, files::Place::Unique(sh.download_dir.clone())).await?;
-            if open {
-                if let Some(first) = saved.first() {
+            if open
+                && let Some(first) = saved.first() {
                     open_local(&first.display().to_string())?;
                 }
-            }
             let saved = saved.iter().map(|p| p.display().to_string()).collect();
             proto::write_msg(s, &Reply { ok: true, saved, ..Default::default() }).await?;
         }
@@ -95,9 +93,9 @@ async fn handle(sh: &Arc<Shared>, s: &mut quinn::SendStream, r: &mut quinn::Recv
             } else {
                 let paths: Vec<PathBuf> = paths.iter().map(|p| crate::paths::expand_tilde(p)).collect();
                 let allowed = match p.read_paths {
-                    Ask::Always => true,
-                    Ask::Never => false,
-                    Ask::Ask => {
+                    Consent::Always => true,
+                    Consent::Never => false,
+                    Consent::Ask => {
                         let list = paths.clone();
                         tokio::task::spawn_blocking(move || confirm_read(&list)).await?
                     }

@@ -105,15 +105,12 @@ fn relay_ip() -> IpAddr {
     {
         return ip;
     }
-    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if s.connect("192.0.2.1:9").is_ok() {
-            if let Ok(a) = s.local_addr() {
-                if !a.ip().is_unspecified() {
+    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && s.connect("192.0.2.1:9").is_ok()
+            && let Ok(a) = s.local_addr()
+                && !a.ip().is_unspecified() {
                     return a.ip();
                 }
-            }
-        }
-    }
     IpAddr::from([127, 0, 0, 1])
 }
 

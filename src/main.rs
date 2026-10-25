@@ -308,9 +308,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                 open: !c.no_open,
                 receive: !c.no_receive,
                 read_paths: match c.read_paths {
-                    AskArg::Ask => client::rpc::Ask::Ask,
-                    AskArg::Always => client::rpc::Ask::Always,
-                    AskArg::Never => client::rpc::Ask::Never,
+                    AskArg::Ask => client::rpc::Consent::Ask,
+                    AskArg::Always => client::rpc::Consent::Always,
+                    AskArg::Never => client::rpc::Consent::Never,
                 },
             };
             let transport = match c.transport {

@@ -210,14 +210,14 @@ pub async fn run(opts: Opts) -> Result<i32> {
             Outcome::Exit(code) => break Ok((code, None)),
             Outcome::Detached(r) => break Ok((0, Some(format!("[qsh: {r}; session {} stays on the server]", hello.session)))),
             Outcome::Quit => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
-            Outcome::Lost(why) => match {
+            Outcome::Lost(why) => {
                 crate::paths::log(format!("connection lost: {why}"));
-                reconnect(&sh, &mut link, &mut ev_rx, &mut hello, &mut pending).await
-            } {
-                Ok(Some(s)) => streams = s,
-                Ok(None) => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
-                Err(e) => break Err(e),
-            },
+                match reconnect(&sh, &mut link, &mut ev_rx, &mut hello, &mut pending).await {
+                    Ok(Some(s)) => streams = s,
+                    Ok(None) => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
+                    Err(e) => break Err(e),
+                }
+            }
         }
     };
 
@@ -402,15 +402,14 @@ async fn drive(
                     // The shell of this session ended. Show another session, if any.
                     let others = rpc_list(&conn).await.unwrap_or_default();
                     let ended = hello.session.clone();
-                    if let Some(next) = others.iter().find(|s| s.name != ended) {
-                        if let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.name.clone())).await {
+                    if let Some(next) = others.iter().find(|s| s.name != ended)
+                        && let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.name.clone())).await {
                             send = s2;
                             reader = Reader::spawn(sh, r2);
                             let _ = sh.out.send(Out::Status(Some(format!("qsh: session {ended} ended; now in session {}", hello.session)))).await;
                             status_until = Some(Instant::now() + Duration::from_secs(3));
                             continue;
                         }
-                    }
                     break Outcome::Exit(code);
                 }
                 break o;
@@ -652,7 +651,7 @@ async fn reconnect(
         let use_tunnel = match link.transport {
             Transport::Udp => false,
             Transport::Ssh => true,
-            Transport::Auto => (attempt % 2 == 0) != prefer_tunnel,
+            Transport::Auto => attempt.is_multiple_of(2) != prefer_tunnel,
         };
         let mut h = hello.clone();
         h.offset = sh.offset.load(Ordering::SeqCst);
@@ -690,10 +689,7 @@ async fn reconnect(
             Some(Err(Fail::Unknown)) => {
                 // The server forgot us: get a new token over SSH and attach again.
                 let Some(spec) = link.spec.clone() else { bail!("the server forgot this client") };
-                match net::spawn_helper(&spec, false, true, true).await {
-                    Ok(hp) => fresh_token = hp.line.token.clone(),
-                    Err(_) => {}
-                }
+                if let Ok(hp) = net::spawn_helper(&spec, false, true, true).await { fresh_token = hp.line.token.clone() }
                 continue;
             }
             Some(Err(Fail::Retry(_))) => {}

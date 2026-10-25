@@ -73,10 +73,9 @@ pub fn random_hex(n: usize) -> String {
 
 /// Debug log: set QSH_LOG to a file path.
 pub fn log(msg: impl AsRef<str>) {
-    if let Some(p) = std::env::var_os("QSH_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+    if let Some(p) = std::env::var_os("QSH_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let _ = writeln!(f, "{}.{:03} [{}] {}", t.as_secs(), t.subsec_millis(), std::process::id(), msg.as_ref());
         }
-    }
 }

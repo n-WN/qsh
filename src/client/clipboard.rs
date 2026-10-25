@@ -129,11 +129,10 @@ mod imp {
                 "image/png" => {
                     // A copied image file (Finder) comes first: the pasteboard's own
                     // image is then only the file icon.
-                    if let Some(p) = file_url_path(&pb).filter(|p| is_image_path(p)) {
-                        if let Some(png) = std::fs::read(&p).ok().and_then(|d| to_png(&d)) {
+                    if let Some(p) = file_url_path(&pb).filter(|p| is_image_path(p))
+                        && let Some(png) = std::fs::read(&p).ok().and_then(|d| to_png(&d)) {
                             return Ok((m.clone(), png));
                         }
-                    }
                     if let Some(d) = pb.dataForType(unsafe { NSPasteboardTypePNG }) {
                         return Ok((m.clone(), d.to_vec()));
                     }
@@ -178,11 +177,10 @@ mod imp {
                 other => {
                     let uti = uti_for(other).map(str::to_string).unwrap_or_else(|| other.to_string());
                     let ok = pb.setData_forType(Some(&NSData::with_bytes(data)), &NSString::from_str(&uti));
-                    if other.starts_with("text/") {
-                        if let Ok(s) = std::str::from_utf8(data) {
+                    if other.starts_with("text/")
+                        && let Ok(s) = std::str::from_utf8(data) {
                             pb.setString_forType(&NSString::from_str(s), unsafe { NSPasteboardTypeString });
                         }
-                    }
                     ok
                 }
             };

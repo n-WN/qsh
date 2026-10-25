@@ -293,13 +293,12 @@ impl Daemon {
         let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx).await;
         {
             let mut st = att.session.st.lock().unwrap();
-            if let Some(slot) = st.clients.get_mut(&att.id) {
-                if slot.epoch == att.epoch {
+            if let Some(slot) = st.clients.get_mut(&att.id)
+                && slot.epoch == att.epoch {
                     slot.conn = None;
                     slot.ctl = None;
                     slot.gone_since = Some(Instant::now());
                 }
-            }
         }
         out.abort();
         att.session.cv.notify_all();
@@ -386,11 +385,10 @@ impl Daemon {
             }
             slot.epoch += 1;
             let epoch = slot.epoch;
-            if let Some(old) = slot.conn.replace(conn.clone()) {
-                if old.stable_id() != conn.stable_id() {
+            if let Some(old) = slot.conn.replace(conn.clone())
+                && old.stable_id() != conn.stable_id() {
                     old.close(1u32.into(), b"superseded");
                 }
-            }
             slot.ctl = Some(ctl);
             slot.size = [h.cols, h.rows, h.xpix, h.ypix];
             slot.gone_since = None;
@@ -580,11 +578,10 @@ impl Daemon {
                         match st.active {
                             None => LocalReply { ok: false, error: Some("no active client".into()), ..Default::default() },
                             Some(id) => {
-                                if let Some(slot) = s.remove_client(&mut st, id) {
-                                    if let Some(ctl) = slot.ctl {
+                                if let Some(slot) = s.remove_client(&mut st, id)
+                                    && let Some(ctl) = slot.ctl {
                                         let _ = ctl.try_send(proto::control_frame(&Control::Detached { reason: "detached by qsh detach".into() }));
                                     }
-                                }
                                 LocalReply { ok: true, ..Default::default() }
                             }
                         }
@@ -744,12 +741,11 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
                 let v = u64::from_be_bytes(p[..8].try_into().unwrap());
                 {
                     let mut st = sess.st.lock().unwrap();
-                    if let Some(slot) = st.clients.get_mut(&id) {
-                        if v > slot.acked {
+                    if let Some(slot) = st.clients.get_mut(&id)
+                        && v > slot.acked {
                             slot.acked = v;
                             slot.ack_at = Instant::now();
                         }
-                    }
                 }
                 sess.cv.notify_all();
                 sess.ack.send_modify(|x| *x = x.wrapping_add(1));
@@ -786,11 +782,10 @@ fn hostname() -> String {
 }
 
 pub fn user_shell() -> String {
-    if let Ok(s) = std::env::var("SHELL") {
-        if !s.is_empty() && Path::new(&s).exists() {
+    if let Ok(s) = std::env::var("SHELL")
+        && !s.is_empty() && Path::new(&s).exists() {
             return s;
         }
-    }
     nix::unistd::User::from_uid(nix::unistd::getuid())
         .ok()
         .flatten()
@@ -837,12 +832,11 @@ fn build_env(name: &str, h: &Hello, shell: &str) -> Result<Vec<(String, String)>
     for (k, v) in &h.env {
         match k.as_str() {
             "COLORTERM" | "TERM_PROGRAM" | "TERM_PROGRAM_VERSION" => set_env(&mut env, k, v.clone()),
-            "LANG" | "LC_ALL" | "LC_CTYPE" | "LC_MESSAGES" | "LC_COLLATE" | "LC_NUMERIC" | "LC_TIME" | "LC_MONETARY" => {
-                if locale_ok(&locales, v) {
+            "LANG" | "LC_ALL" | "LC_CTYPE" | "LC_MESSAGES" | "LC_COLLATE" | "LC_NUMERIC" | "LC_TIME" | "LC_MONETARY"
+                if locale_ok(&locales, v) => {
                     set_env(&mut env, k, v.clone());
                     have_lang |= k == "LANG" || k == "LC_ALL";
                 }
-            }
             _ => {}
         }
     }
@@ -880,8 +874,8 @@ fn resolve_term(term: &str, terminfo: Option<&str>) -> String {
     if has_terminfo(term) {
         return term.to_string();
     }
-    if let Some(src) = terminfo {
-        if let Ok(dir) = paths::run_dir() {
+    if let Some(src) = terminfo
+        && let Ok(dir) = paths::run_dir() {
             let f = dir.join(format!("terminfo-{term}.src"));
             if std::fs::write(&f, src).is_ok() {
                 let out = paths::home().join(".terminfo");
@@ -900,7 +894,6 @@ fn resolve_term(term: &str, terminfo: Option<&str>) -> String {
                 }
             }
         }
-    }
     fallback
 }
 

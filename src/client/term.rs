@@ -8,14 +8,29 @@ use std::{
 use base64::Engine;
 use tokio::sync::mpsc;
 
-pub fn size() -> (u16, u16) {
+/// Terminal size: columns, rows, and width and height in pixels (0 if unknown).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+    pub xpix: u16,
+    pub ypix: u16,
+}
+
+impl Size {
+    pub fn encode(&self) -> Vec<u8> {
+        [self.cols, self.rows, self.xpix, self.ypix].iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+}
+
+pub fn size() -> Size {
     for fd in [1, 0, 2] {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            return (ws.ws_col, ws.ws_row);
+            return Size { cols: ws.ws_col, rows: ws.ws_row, xpix: ws.ws_xpixel, ypix: ws.ws_ypixel };
         }
     }
-    (80, 24)
+    Size { cols: 80, rows: 24, xpix: 0, ypix: 0 }
 }
 
 pub fn is_tty() -> bool {
@@ -61,7 +76,7 @@ pub fn restore() {
 #[derive(Debug)]
 pub enum Event {
     Input(Vec<u8>),
-    Resize(u16, u16),
+    Resize(Size),
     Detach,
     Quit,
     /// The `Ctrl-^ ?` help request.

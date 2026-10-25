@@ -121,8 +121,8 @@ impl vt100::Callbacks for Tracker {
 }
 
 pub struct ClientSlot {
-    pub cols: u16,
-    pub rows: u16,
+    /// cols, rows, width and height in pixels
+    pub size: [u16; 4],
     pub readonly: bool,
     pub resume_token: String,
     pub conn: Option<quinn::Connection>,
@@ -142,8 +142,7 @@ pub struct State {
     pub parser: vt100::Parser<Tracker>,
     pub clients: BTreeMap<u64, ClientSlot>,
     pub active: Option<u64>,
-    pub cols: u16,
-    pub rows: u16,
+    pub size: [u16; 4],
 }
 
 pub struct Session {
@@ -173,10 +172,9 @@ impl Session {
         login: bool,
         env: &[(String, String)],
         cwd: &Path,
-        cols: u16,
-        rows: u16,
+        size: [u16; 4],
     ) -> Result<Arc<Session>> {
-        let p = pty::spawn(argv, login, env, cwd, cols, rows)?;
+        let p = pty::spawn(argv, login, env, cwd, size)?;
         let pid = p.child.id() as i32;
         let reader = p.master.try_clone()?;
         let writer = p.master.try_clone()?;
@@ -190,11 +188,10 @@ impl Session {
             input_tx,
             st: Mutex::new(State {
                 ring: Ring::new(RING_CAP),
-                parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), SCROLLBACK, Tracker::default()),
+                parser: vt100::Parser::new_with_callbacks(nz(size[1]), nz(size[0]), SCROLLBACK, Tracker::default()),
                 clients: BTreeMap::new(),
                 active: None,
-                cols,
-                rows,
+                size,
             }),
             cv: Condvar::new(),
             head: watch::Sender::new(0),
@@ -254,14 +251,15 @@ impl Session {
         let _ = self.input_tx.send(data);
     }
 
-    pub fn resize(&self, st: &mut State, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 || (st.cols == cols && st.rows == rows) {
+    pub fn resize(&self, st: &mut State, size: [u16; 4]) {
+        if size[0] == 0 || size[1] == 0 || st.size == size {
             return;
         }
-        st.cols = cols;
-        st.rows = rows;
-        st.parser.set_size(nz(rows), nz(cols));
-        pty::resize(&self.master, cols, rows);
+        if st.size[..2] != size[..2] {
+            st.parser.set_size(nz(size[1]), nz(size[0]));
+        }
+        st.size = size;
+        pty::resize(&self.master, size[0], size[1], size[2], size[3]);
     }
 
     /// The shell's current directory (falls back to $HOME).
@@ -273,8 +271,8 @@ impl Session {
     pub fn activate(&self, st: &mut State, id: u64) {
         st.active = Some(id);
         if let Some(c) = st.clients.get(&id) {
-            let (cols, rows) = (c.cols, c.rows);
-            self.resize(st, cols, rows);
+            let size = c.size;
+            self.resize(st, size);
         }
     }
 
@@ -424,7 +422,7 @@ mod tests {
         }
         p.process(b"\x1b[31mred\x1b[0m $ ");
         p.process(b"\x1b[>1u\x1b]2;hello\x07");
-        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, cols: 20, rows: 5 };
+        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, size: [20, 5, 0, 0] };
         let snap = st.snapshot(true);
         let mut q = vt100::Parser::new(nz(5), nz(20), 100);
         q.process(b"local prompt $ ");
@@ -446,7 +444,7 @@ mod tests {
     fn catch_up_snapshot_leaves_no_old_text() {
         let mut p = vt100::Parser::new_with_callbacks(nz(4), nz(20), 100, Tracker::default());
         p.process(b"a\r\nb\r\n$ ");
-        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, cols: 20, rows: 4 };
+        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, size: [20, 4, 0, 0] };
         let snap = st.snapshot(false);
         let mut q = vt100::Parser::new(nz(4), nz(20), 100);
         q.process(b"XXXXXXXXXXXXXXXXXXXX\r\nYYYYYYYYYYYYYYYYYYYY\r\nZZZZ\x1b[2;5H");
@@ -462,7 +460,7 @@ mod tests {
         let mut p = vt100::Parser::new_with_callbacks(nz(5), nz(20), 100, Tracker::default());
         p.process(b"shell 1\r\nshell 2\r\n$ vim");
         p.process(b"\x1b[?1049h\x1b[H\x1b[2Jeditor text");
-        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, cols: 20, rows: 5 };
+        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, size: [20, 5, 0, 0] };
         let snap = st.snapshot(true);
         let mut q = vt100::Parser::new(nz(5), nz(20), 100);
         q.process(&snap);

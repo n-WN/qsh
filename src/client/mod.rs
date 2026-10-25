@@ -85,6 +85,13 @@ fn term_env() -> (String, Option<String>, Vec<(String, String)>) {
     (term, terminfo, env)
 }
 
+fn set_size(h: &mut Hello, s: term::Size) {
+    h.cols = s.cols;
+    h.rows = s.rows;
+    h.xpix = s.xpix;
+    h.ypix = s.ypix;
+}
+
 async fn handshake(conn: &quinn::Connection, hello: &Hello) -> std::result::Result<(quinn::SendStream, quinn::RecvStream, Welcome), Fail> {
     let (mut s, mut r) = conn.open_bi().await.map_err(|e| Fail::Retry(e.into()))?;
     proto::write_msg(&mut s, hello).await.map_err(Fail::Retry)?;
@@ -103,7 +110,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
     if !term::is_tty() {
         bail!("qsh needs a terminal on stdin and stdout");
     }
-    let (cols, rows) = term::size();
+    let size = term::size();
     let (term_name, terminfo, env) = term_env();
 
     // Bootstrap: SSH gives the port, the certificate fingerprint and a one-time token.
@@ -131,8 +138,10 @@ pub async fn run(opts: Opts) -> Result<i32> {
         session: opts.session.clone(),
         client_id: None,
         offset: 0,
-        cols,
-        rows,
+        cols: size.cols,
+        rows: size.rows,
+        xpix: size.xpix,
+        ypix: size.ypix,
         term: term_name,
         terminfo,
         env,
@@ -180,8 +189,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
     tokio::spawn(async move {
         let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) else { return };
         while s.recv().await.is_some() {
-            let (c, r) = term::size();
-            if ev_tx.send(Event::Resize(c, r)).is_err() {
+            if ev_tx.send(Event::Resize(term::size())).is_err() {
                 break;
             }
         }
@@ -268,10 +276,8 @@ async fn drive(
     hello: &mut Hello,
     pending: &mut Vec<u8>,
 ) -> Outcome {
-    let mut resize = Vec::with_capacity(4);
-    resize.extend_from_slice(&hello.cols.to_be_bytes());
-    resize.extend_from_slice(&hello.rows.to_be_bytes());
-    if send.write_all(&proto::frame(kind::RESIZE, &resize)).await.is_err() {
+    let size = term::Size { cols: hello.cols, rows: hello.rows, xpix: hello.xpix, ypix: hello.ypix };
+    if send.write_all(&proto::frame(kind::RESIZE, &size.encode())).await.is_err() {
         return Outcome::Lost("write".into());
     }
     if !pending.is_empty() {
@@ -326,13 +332,9 @@ async fn drive(
                             break Outcome::Lost("write".into());
                         }
                     }
-                    Event::Resize(c, r) => {
-                        hello.cols = c;
-                        hello.rows = r;
-                        let mut p = Vec::with_capacity(4);
-                        p.extend_from_slice(&c.to_be_bytes());
-                        p.extend_from_slice(&r.to_be_bytes());
-                        if send.write_all(&proto::frame(kind::RESIZE, &p)).await.is_err() {
+                    Event::Resize(sz) => {
+                        set_size(hello, sz);
+                        if send.write_all(&proto::frame(kind::RESIZE, &sz.encode())).await.is_err() {
                             break Outcome::Lost("write".into());
                         }
                     }
@@ -521,7 +523,7 @@ async fn reconnect(
                     r = &mut fut => break Some(r),
                     ev = ev_rx.recv() => match ev {
                         Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
-                        Some(Event::Resize(c, r)) => { hello.cols = c; hello.rows = r; }
+                        Some(Event::Resize(sz)) => set_size(hello, sz),
                         Some(Event::Help) | Some(Event::Migrate(_)) => {}
                         Some(Event::Quit) | Some(Event::Detach) | None => break None,
                     }
@@ -559,7 +561,7 @@ async fn reconnect(
                 _ = &mut sleep => break,
                 ev = ev_rx.recv() => match ev {
                     Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
-                    Some(Event::Resize(c, r)) => { hello.cols = c; hello.rows = r; }
+                    Some(Event::Resize(sz)) => set_size(hello, sz),
                     Some(Event::Help) | Some(Event::Migrate(_)) => {}
                     Some(Event::Quit) | Some(Event::Detach) | None => return Ok(None),
                 }

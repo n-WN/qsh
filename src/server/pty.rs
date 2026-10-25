@@ -21,20 +21,20 @@ fn set_cloexec(fd: &OwnedFd) {
     }
 }
 
-pub fn winsize(cols: u16, rows: u16) -> libc::winsize {
-    libc::winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 }
+pub fn winsize(cols: u16, rows: u16, xpix: u16, ypix: u16) -> libc::winsize {
+    libc::winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: xpix, ws_ypixel: ypix }
 }
 
-pub fn resize(master: &OwnedFd, cols: u16, rows: u16) {
-    let ws = winsize(cols, rows);
+pub fn resize(master: &OwnedFd, cols: u16, rows: u16, xpix: u16, ypix: u16) {
+    let ws = winsize(cols, rows, xpix, ypix);
     unsafe {
         libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
     }
 }
 
 /// Start `argv` on a new pty. `login` makes argv[0] start with '-' (a login shell).
-pub fn spawn(argv: &[String], login: bool, env: &[(String, String)], cwd: &Path, cols: u16, rows: u16) -> Result<Pty> {
-    let ws = winsize(cols, rows);
+pub fn spawn(argv: &[String], login: bool, env: &[(String, String)], cwd: &Path, size: [u16; 4]) -> Result<Pty> {
+    let ws = winsize(size[0], size[1], size[2], size[3]);
     let r = nix::pty::openpty(Some(&ws), None).context("openpty")?;
     set_cloexec(&r.master);
     set_cloexec(&r.slave);

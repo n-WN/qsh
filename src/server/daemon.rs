@@ -308,8 +308,7 @@ impl Daemon {
                 }
             }
             slot.ctl = Some(ctl);
-            slot.cols = h.cols;
-            slot.rows = h.rows;
+            slot.size = [h.cols, h.rows, h.xpix, h.ypix];
             slot.gone_since = None;
             slot.acked = h.offset;
             slot.ack_at = Instant::now();
@@ -319,7 +318,7 @@ impl Daemon {
             let readonly = slot.readonly;
             let token = slot.resume_token.clone();
             if st.active == Some(id) {
-                sess.resize(&mut st, h.cols, h.rows);
+                sess.resize(&mut st, [h.cols, h.rows, h.xpix, h.ypix]);
             }
             drop(st);
             return Ok(Attached {
@@ -392,8 +391,7 @@ impl Daemon {
         st.clients.insert(
             id,
             ClientSlot {
-                cols: h.cols,
-                rows: h.rows,
+                size: [h.cols, h.rows, h.xpix, h.ypix],
                 readonly,
                 resume_token: token.clone(),
                 conn: Some(conn.clone()),
@@ -426,7 +424,7 @@ impl Daemon {
             (vec![shell.clone(), "-c".to_string(), h.command.join(" ")], false)
         };
         let env = build_env(name, h, &shell)?;
-        Session::start(name, &argv, login, &env, &paths::home(), h.cols, h.rows)
+        Session::start(name, &argv, login, &env, &paths::home(), [h.cols, h.rows, h.xpix, h.ypix])
     }
 
     /// The connection of the client that should serve a request from a tool.
@@ -470,8 +468,8 @@ impl Daemon {
                             pid: s.pid,
                             created: s.created,
                             command: s.command.clone(),
-                            cols: st.cols,
-                            rows: st.rows,
+                            cols: st.size[0],
+                            rows: st.size[1],
                             clients: st.clients.len(),
                             connected: st.clients.values().filter(|c| c.conn.is_some()).count(),
                         }
@@ -655,15 +653,14 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
                 }
             }
             kind::RESIZE if p.len() >= 4 => {
-                let cols = u16::from_be_bytes([p[0], p[1]]);
-                let rows = u16::from_be_bytes([p[2], p[3]]);
+                let v = |i: usize| if p.len() >= i + 2 { u16::from_be_bytes([p[i], p[i + 1]]) } else { 0 };
+                let size = [v(0), v(2), v(4), v(6)];
                 let mut st = sess.st.lock().unwrap();
                 if let Some(slot) = st.clients.get_mut(&id) {
-                    slot.cols = cols;
-                    slot.rows = rows;
+                    slot.size = size;
                 }
                 if st.active == Some(id) {
-                    sess.resize(&mut st, cols, rows);
+                    sess.resize(&mut st, size);
                 }
             }
             kind::ACK if p.len() >= 8 => {

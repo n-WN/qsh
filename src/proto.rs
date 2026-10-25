@@ -104,6 +104,10 @@ pub struct Hello {
     pub offset: u64,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub xpix: u16,
+    #[serde(default)]
+    pub ypix: u16,
     pub term: String,
     pub terminfo: Option<String>,
     pub env: Vec<(String, String)>,

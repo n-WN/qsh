@@ -1,0 +1,136 @@
+//! TLS for QUIC: a self-signed server certificate, pinned by SHA-256 on the client.
+//! The pin travels over the authenticated SSH channel, as with mosh's session key.
+
+use std::{path::Path, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+};
+
+use crate::proto::ALPN;
+
+pub fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+pub fn fingerprint(cert: &[u8]) -> String {
+    hex::encode(ring::digest::digest(&ring::digest::SHA256, cert))
+}
+
+pub struct Identity {
+    pub cert: CertificateDer<'static>,
+    pub key: PrivateKeyDer<'static>,
+    pub fp: String,
+}
+
+/// Load the daemon certificate, or make a new one. A stable certificate keeps the
+/// fingerprint the same when the daemon restarts.
+pub fn load_or_create(dir: &Path) -> Result<Identity> {
+    let cp = dir.join("cert.der");
+    let kp = dir.join("key.der");
+    if let (Ok(c), Ok(k)) = (std::fs::read(&cp), std::fs::read(&kp)) {
+        let fp = fingerprint(&c);
+        return Ok(Identity {
+            cert: CertificateDer::from(c),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k)),
+            fp,
+        });
+    }
+    let ck = rcgen::generate_simple_self_signed(vec!["qsh".to_string()])?;
+    let c = ck.cert.der().to_vec();
+    let k = ck.signing_key.serialize_der();
+    crate::paths::write_private(&kp, &k)?;
+    crate::paths::write_private(&cp, &c)?;
+    let fp = fingerprint(&c);
+    Ok(Identity { cert: CertificateDer::from(c), key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k)), fp })
+}
+
+pub fn transport() -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    t.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    t.keep_alive_interval(Some(Duration::from_secs(1)));
+    t.stream_receive_window((4u32 << 20).into());
+    t.receive_window((16u32 << 20).into());
+    t.send_window(16 << 20);
+    t.max_concurrent_bidi_streams(256u32.into());
+    t.initial_rtt(Duration::from_millis(150));
+    t
+}
+
+pub fn server_config(id: &Identity) -> Result<quinn::ServerConfig> {
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(vec![id.cert.clone()], id.key.clone_key())?;
+    cfg.alpn_protocols = vec![ALPN.to_vec()];
+    let q = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)?;
+    let mut sc = quinn::ServerConfig::with_crypto(Arc::new(q));
+    sc.transport_config(Arc::new(transport()));
+    sc.migration(true);
+    Ok(sc)
+}
+
+pub fn client_config(fp_hex: &str) -> Result<quinn::ClientConfig> {
+    let fp = hex::decode(fp_hex).context("bad fingerprint")?;
+    let p = provider();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(p.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Pinned { fp, provider: p }))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![ALPN.to_vec()];
+    let q = quinn::crypto::rustls::QuicClientConfig::try_from(cfg)?;
+    let mut cc = quinn::ClientConfig::new(Arc::new(q));
+    cc.transport_config(Arc::new(transport()));
+    Ok(cc)
+}
+
+#[derive(Debug)]
+struct Pinned {
+    fp: Vec<u8>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let got = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        if got.as_ref() == self.fp.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("server certificate fingerprint mismatch".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}

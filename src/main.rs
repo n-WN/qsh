@@ -214,6 +214,14 @@ fn main() {
         std::process::exit(tools::shim(&argv0, &args[1..]));
     }
     let cli = Cli::parse();
+    if let Ok(filter) = std::env::var("QSH_TRACE") {
+        let w = std::env::var("QSH_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        let b = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter)).with_ansi(false);
+        match w {
+            Some(f) => b.with_writer(std::sync::Mutex::new(f)).init(),
+            None => b.with_writer(std::io::stderr).init(),
+        }
+    }
     let code = match real_main(cli) {
         Ok(c) => c,
         Err(e) => {

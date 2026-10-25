@@ -2,7 +2,13 @@
 //! gets connection details, prints them on one line, and (with `--tunnel`)
 //! then relays QUIC datagrams between SSH stdio and the daemon's UDP port.
 
-use std::{os::unix::process::CommandExt, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    os::unix::process::CommandExt,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -87,10 +93,41 @@ pub async fn run(a: HelperArgs) -> Result<()> {
     Ok(())
 }
 
+/// A routable local address for the relay, not loopback. QUIC keeps the local
+/// address where a connection started; a connection that started on loopback
+/// cannot later move to a real network path (the kernel does not send from
+/// 127.0.0.1 to a remote host).
+fn relay_ip() -> IpAddr {
+    if let Some(ip) = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(2).and_then(|x| x.parse::<IpAddr>().ok()))
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+    {
+        return ip;
+    }
+    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if s.connect("192.0.2.1:9").is_ok() {
+            if let Ok(a) = s.local_addr() {
+                if !a.ip().is_unspecified() {
+                    return a.ip();
+                }
+            }
+        }
+    }
+    IpAddr::from([127, 0, 0, 1])
+}
+
 /// Frames on stdio: `[u16 length][datagram]`.
 async fn relay(port: u16, mut out: tokio::io::Stdout) -> Result<()> {
-    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-    udp.connect(("127.0.0.1", port)).await?;
+    let ip = relay_ip();
+    let udp = match tokio::net::UdpSocket::bind(SocketAddr::new(if ip.is_ipv4() { [0, 0, 0, 0].into() } else { std::net::Ipv6Addr::UNSPECIFIED.into() }, 0)).await {
+        Ok(u) if u.connect((ip, port)).await.is_ok() => u,
+        _ => {
+            let u = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+            u.connect(("127.0.0.1", port)).await?;
+            u
+        }
+    };
     let udp = Arc::new(udp);
     let u2 = udp.clone();
     let up = async move {

@@ -67,6 +67,8 @@ pub enum Event {
     Quit,
     /// The `Ctrl-^ ?` help request.
     Help,
+    /// Move the connection to another path (SIGUSR1: new UDP socket, SIGUSR2: SSH tunnel).
+    Migrate(super::net::PathKind),
 }
 
 /// Escape prefix: Ctrl-^ (as in mosh). `Ctrl-^ .` quits, `Ctrl-^ d` detaches,

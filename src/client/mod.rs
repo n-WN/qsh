@@ -166,6 +166,17 @@ pub async fn run(opts: Opts) -> Result<i32> {
     let out_thread = term::spawn_stdout(out_rx, opts.osc52);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
     term::spawn_stdin(ev_tx.clone());
+    for (sig, kind) in [(libc::SIGUSR1, PathKind::Direct), (libc::SIGUSR2, PathKind::Tunnel)] {
+        let tx = ev_tx.clone();
+        tokio::spawn(async move {
+            let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(sig)) else { return };
+            while s.recv().await.is_some() {
+                if tx.send(Event::Migrate(kind)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
         let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) else { return };
         while s.recv().await.is_some() {
@@ -284,10 +295,20 @@ async fn drive(
         }
     });
     let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<bool>();
+    // Liveness: the server echoes our datagrams. Received packets alone are not
+    // enough: when only the upstream direction fails, data still comes in.
+    let last_echo = Arc::new(Mutex::new(Instant::now()));
+    let le = last_echo.clone();
+    let c4 = conn.clone();
+    let echo = tokio::spawn(async move {
+        while c4.read_datagram().await.is_ok() {
+            *le.lock().unwrap() = Instant::now();
+        }
+    });
 
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut last_rx_count = conn.stats().udp_rx.datagrams;
-    let mut last_rx = Instant::now();
+    let mut last_ping = Instant::now() - Duration::from_secs(10);
+    let mut seq: u32 = 0;
     let mut rebound = false;
     let mut shown: Option<u64> = None;
     let mut last_probe = Instant::now();
@@ -325,6 +346,19 @@ async fn drive(
                     Event::Help => {
                         let _ = sh.out.send(Out::Message(HELP.into())).await;
                     }
+                    Event::Migrate(PathKind::Direct) => {
+                        crate::paths::log("signal: move to a new UDP socket");
+                        let _ = link.use_direct();
+                    }
+                    Event::Migrate(PathKind::Tunnel) => {
+                        if let Some(spec) = link.spec.clone() {
+                            crate::paths::log("signal: move to the SSH tunnel");
+                            match net::spawn_helper(&spec, true, false, true).await {
+                                Ok(h) => { let _ = link.use_tunnel(h); }
+                                Err(e) => crate::paths::log(format!("tunnel: {e:#}")),
+                            }
+                        }
+                    }
                 }
             }
             o = net_rx.recv() => break o.unwrap_or(Outcome::Lost("reader".into())),
@@ -332,16 +366,19 @@ async fn drive(
                 probing = false;
                 // UDP works again: move this connection off the SSH tunnel.
                 if ok && link.kind == PathKind::Tunnel && link.use_direct().is_ok() {
+                    crate::paths::log("UDP works again: connection moved to direct UDP");
                     rebound = false;
                 }
             }
             _ = tick.tick() => {
-                let n = conn.stats().udp_rx.datagrams;
-                if n != last_rx_count {
-                    last_rx_count = n;
-                    last_rx = Instant::now();
+                if last_ping.elapsed() >= Duration::from_millis(1000) {
+                    last_ping = Instant::now();
+                    seq = seq.wrapping_add(1);
+                    let mut d = vec![b'P'];
+                    d.extend_from_slice(&seq.to_be_bytes());
+                    let _ = conn.send_datagram(d.into());
                 }
-                let idle = last_rx.elapsed();
+                let idle = last_echo.lock().unwrap().elapsed();
                 if idle > Duration::from_millis(2500) {
                     let secs = idle.as_secs();
                     if shown != Some(secs) {
@@ -354,6 +391,7 @@ async fn drive(
                 if idle > Duration::from_secs(3) && !rebound && link.kind == PathKind::Direct {
                     // Maybe the network changed: a new socket gives a new path.
                     rebound = true;
+                    crate::paths::log("no echo for 3s: rebind to a new UDP socket");
                     let _ = link.use_direct();
                 }
                 if idle > Duration::from_secs(8) {
@@ -376,6 +414,7 @@ async fn drive(
     };
     reader.abort();
     acceptor.abort();
+    echo.abort();
     if shown.is_some() {
         let _ = sh.out.try_send(Out::Status(None));
     }
@@ -472,7 +511,7 @@ async fn reconnect(
                     ev = ev_rx.recv() => match ev {
                         Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
                         Some(Event::Resize(c, r)) => { hello.cols = c; hello.rows = r; }
-                        Some(Event::Help) => {}
+                        Some(Event::Help) | Some(Event::Migrate(_)) => {}
                         Some(Event::Quit) | Some(Event::Detach) | None => break None,
                     }
                 }
@@ -481,6 +520,7 @@ async fn reconnect(
         match res {
             None => return Ok(None),
             Some(Ok((conn, s, r, w))) => {
+                crate::paths::log(format!("reconnected via {:?} after {:?}, resume at {}", link.kind, start.elapsed(), h.offset));
                 if fresh_token.is_some() {
                     hello.client_id = Some(w.client_id);
                     hello.token = w.resume_token;
@@ -509,7 +549,7 @@ async fn reconnect(
                 ev = ev_rx.recv() => match ev {
                     Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
                     Some(Event::Resize(c, r)) => { hello.cols = c; hello.rows = r; }
-                    Some(Event::Help) => {}
+                    Some(Event::Help) | Some(Event::Migrate(_)) => {}
                     Some(Event::Quit) | Some(Event::Detach) | None => return Ok(None),
                 }
             }

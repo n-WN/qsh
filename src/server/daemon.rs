@@ -243,6 +243,14 @@ impl Daemon {
             let _ = send.finish();
         });
 
+        // Echo datagrams: the client uses them to check the path end to end.
+        let c3 = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = c3.read_datagram().await {
+                let _ = c3.send_datagram(d);
+            }
+        });
+
         let sess = att.session.clone();
         let c2 = conn.clone();
         tokio::spawn(async move {

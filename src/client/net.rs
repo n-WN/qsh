@@ -31,7 +31,8 @@ pub struct SshSpec {
 }
 
 impl SshSpec {
-    fn remote_command(&self, args: &str) -> String {
+    /// The command that ssh runs on the server: find qsh, then run it with `args`.
+    pub fn remote_command(&self, args: &str) -> String {
         match &self.server_path {
             Some(p) => format!("{p} {args}"),
             None => format!(

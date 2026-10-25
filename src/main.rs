@@ -74,6 +74,7 @@ struct ConnectArgs {
     /// Do not copy OSC 52 clipboard writes into the local clipboard.
     #[arg(long)]
     no_osc52: bool,
+    /// Tell which network path the connection uses.
     #[arg(short, long)]
     verbose: bool,
     /// Command to run in a new session (instead of the login shell).
@@ -99,6 +100,7 @@ enum AskArg {
 enum Cmd {
     /// List sessions (on HOST, or on this server inside a session).
     Ls {
+        /// [user@]host (leave out inside a session).
         destination: Option<String>,
         #[command(flatten)]
         ssh: SshArgs,
@@ -138,6 +140,7 @@ enum Cmd {
     Detach,
     /// (In a session) make a link that lets another person join this session.
     Share {
+        /// The other person can watch, but cannot type.
         #[arg(long)]
         readonly: bool,
         /// Link lifetime in seconds.
@@ -247,10 +250,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             let spec = ssh_spec(&dest, &ssh)?;
             let mut cmd = std::process::Command::new(&spec.argv[0]);
             cmd.args(&spec.argv[1..]).arg("-T").arg(&dest);
-            cmd.arg(match &spec.server_path {
-                Some(p) => format!("{p} helper --list"),
-                None => "sh -c 'Q=$(command -v qsh || echo \"$HOME/.local/bin/qsh\"); exec \"$Q\" helper --list'".to_string(),
-            });
+            cmd.arg(spec.remote_command("helper --list"));
             let out = cmd.output()?;
             if !out.status.success() {
                 bail!("ssh failed: {}", String::from_utf8_lossy(&out.stderr).trim());

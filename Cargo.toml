@@ -2,6 +2,7 @@
 name = "qsh"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A durable remote terminal over QUIC: roaming, native scrollback, kitty graphics, clipboard and file transfer."
 license = "MIT"
 

@@ -58,7 +58,7 @@ behind gets a snapshot.
 
 ## Install
 
-Build on both machines (Rust 1.85 or later):
+Build on both machines (Rust 1.88 or later):
 
 ```sh
 cargo build --release
@@ -71,8 +71,8 @@ To build and install on a Linux server from this tree:
 scripts/deploy.sh user@host -i ~/.ssh/key
 ```
 
-The server looks for `qsh` in `PATH`, `~/.local/bin`, `~/.cargo/bin`, or use
-`--server PATH`.
+On the server, the client looks for `qsh` in `PATH`, `~/.local/bin`,
+`~/.cargo/bin` and `~/.qsh/bin`. Use `--server PATH` for another place.
 
 ## Use
 
@@ -85,7 +85,13 @@ qsh ls host                   # list sessions
 qsh --ssh "ssh -i ~/.ssh/key -p 2222" user@host
 qsh --port 60100 host         # UDP port for the daemon (default: first free in 60001-60999)
 qsh --transport ssh host      # always use the SSH tunnel (or: udp, auto)
+qsh -v host                   # tell which network path the connection uses
+qsh --download-dir ~/inbox host   # where `qsh send` puts files (default: ~/Downloads)
 ```
+
+Options that limit what the server can do on your machine: `--no-clipboard`,
+`--no-receive`, `--no-open`, `--no-osc52`, `--read-paths ask|always|never`
+(see [Security](#security)).
 
 Keys (the prefix is `Ctrl-^`, as in mosh):
 
@@ -110,11 +116,14 @@ qsh send report.pdf logs/     # to the local download folder (~/Downloads)
 qsh send --open plot.png      # send and open on the local machine
 qsh get                       # a file picker opens on the local machine (macOS)
 qsh get ~/Desktop/data.csv    # local file by path (the local user must allow it)
+qsh get -C ~/in               # put the files into ~/in (default: current folder)
 qsh clip paste -t image/png > shot.png
 qsh clip copy < notes.txt
 qsh clip list
 qsh open https://example.com  # opens in the local browser
+qsh open report.pdf           # sends the file and opens it on the local machine
 qsh share [--readonly]        # a qsh:// link for another person (1 hour)
+qsh share --ttl 600           # the link works for 10 minutes
 qsh detach
 qsh ls
 ```
@@ -130,6 +139,21 @@ echo hi | wl-copy
 
 `xdg-open` and `$BROWSER` open links on the local machine. OSC 52 writes from
 remote programs (vim, tmux, Claude Code) also go into the local clipboard.
+
+The shell of a session gets these variables:
+
+| Variable | Value |
+|---|---|
+| `QSH` | `1` |
+| `QSH_SESSION` | the session name |
+| `QSH_SOCK` | the daemon socket that the tools use |
+| `QSH_BIN` | `~/.qsh/bin`, the folder with the shims; it is first in `PATH` |
+| `BROWSER` | the `xdg-open` shim |
+| `TERM` | from the client; `xterm-256color` if the server has no terminfo entry and cannot compile the client's |
+| `COLORTERM`, `LANG`, `LC_*` | from the client; locales that the server does not have are left out, and `LANG` is then `C.UTF-8` |
+
+A login profile can reset `PATH`. For bash, `PROMPT_COMMAND` puts `QSH_BIN`
+back at the first prompt.
 
 ### On your machine
 
@@ -164,8 +188,11 @@ another). It does not log in again. It was faster than scp in a test
 
 - Snapshots (reattach, far lag) do not contain kitty graphics images. Normal
   streaming and resume from the ring buffer keep them.
-- With two clients on one session, the pty size follows the client that typed
-  last. Terminal replies from the other client are dropped (heuristic).
+- A snapshot brings back at most 5000 lines of history (the size of the
+  server's vt100 mirror).
+- With two clients on one session, the pty size follows the client that
+  attached or typed last. A client with a different window size sees that
+  layout. Terminal replies from the other client are dropped (heuristic).
 - The file picker and the consent dialog use AppleScript (macOS). On Linux
   clients, give paths and use `--read-paths always`.
 - Reconnects through the SSH tunnel use `BatchMode`: they need key or agent
@@ -176,7 +203,7 @@ another). It does not log in again. It was faster than scp in a test
 ## Tests
 
 ```sh
-cargo test                     # ring buffer, snapshots, archive, scanner, keys, MIME mapping
+cargo test                     # ring buffer, snapshots, archive, VT scanner, kitty keys, reply filter, MIME mapping
 tests/e2e/kitty_graphics.py target/release/qsh host local.png remote.png --port P
 ```
 
@@ -192,7 +219,34 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
   the same bytes (MD5).
 - `kitten icat` on the server: the PNG reaches the local terminal unchanged.
 - Detach and reattach from a new terminal: screen and scrollback come back.
+- Ctrl-C during an output flood: the prompt comes back in about 0.5 s.
+- Session switch with `Ctrl-^ c` / `Ctrl-^ p`: each session shows only its own
+  scrollback. When a session's shell exits, the client moves to another one.
+- A read-write share link: the guest can type, but `Ctrl-^ c` makes no session.
+- 6 s of dropped UDP: the window title shows `[qsh: no contact for 4s]`; the
+  remote title comes back after the outage.
 
-Debug: `QSH_LOG=/tmp/qsh.log` writes connection events; `QSH_TRACE=quinn=debug`
+## Source layout
+
+| File | Content |
+|---|---|
+| `src/main.rs` | command line, shim dispatch by program name |
+| `src/proto.rs` | frames and messages |
+| `src/tls.rs` | certificate, fingerprint pinning, QUIC transport settings |
+| `src/files.rs` | streaming archive for file transfer |
+| `src/tools.rs` | tools inside a session, and the clipboard shims |
+| `src/server/daemon.rs` | QUIC listener, attach and resume, flow control, local socket |
+| `src/server/session.rs` | pty session, ring buffer, vt100 mirror, snapshots |
+| `src/server/helper.rs` | `qsh helper` (SSH bootstrap and datagram relay) |
+| `src/server/pty.rs` | pty and child process |
+| `src/client/mod.rs` | connect, liveness, reconnect, session switch |
+| `src/client/net.rs` | SSH helper process, SSH tunnel socket, path changes |
+| `src/client/term.rs` | raw mode, keys, output thread, VT scanner |
+| `src/client/rpc.rs` | requests from the server, `qsh cp` |
+| `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |
+
+## Debug
+
+`QSH_LOG=/tmp/qsh.log` writes connection events; `QSH_TRACE=quinn=debug`
 adds quinn tracing. `kill -USR1` / `kill -USR2` on the client moves the
 connection to a new UDP socket / to the SSH tunnel.

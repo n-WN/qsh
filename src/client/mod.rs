@@ -24,6 +24,7 @@ use net::{Link, PathKind, SshSpec, Transport};
 use term::{Event, Out};
 
 pub struct Opts {
+    pub new_session: bool,
     pub ssh: Option<SshSpec>,
     /// For share links: address, fingerprint and token, without SSH.
     pub direct: Option<(SocketAddr, String, String)>,
@@ -60,7 +61,7 @@ enum Fail {
 
 type Streams = (quinn::Connection, quinn::SendStream, quinn::RecvStream);
 
-const HELP: &str = "qsh: Ctrl-^ .  quit (session stays)   Ctrl-^ d  detach   Ctrl-^ Ctrl-^  send Ctrl-^";
+const HELP: &str = "qsh keys after Ctrl-^:  . quit (session stays)  d detach  c new session  n/p next/previous  0-9 select  w list  Ctrl-^ send Ctrl-^";
 
 fn term_env() -> (String, Option<String>, Vec<(String, String)>) {
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
@@ -147,6 +148,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
         env,
         command: opts.command.clone(),
         server_addr: link.addr.to_string(),
+        new: opts.new_session,
     };
     let (send, recv, w) = match handshake(&conn, &hello).await {
         Ok(x) => x,
@@ -155,6 +157,8 @@ pub async fn run(opts: Opts) -> Result<i32> {
     };
     hello.client_id = Some(w.client_id);
     hello.token = w.resume_token.clone();
+    hello.session = w.session.clone();
+    hello.new = false;
     hello.terminfo = None;
     hello.command.clear();
     if w.readonly {
@@ -204,14 +208,14 @@ pub async fn run(opts: Opts) -> Result<i32> {
         *sh.conn.lock().unwrap() = None;
         match o {
             Outcome::Exit(code) => break Ok((code, None)),
-            Outcome::Detached(r) => break Ok((0, Some(format!("[qsh: {r}; session {} stays on the server]", w.session)))),
-            Outcome::Quit => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", w.session)))),
+            Outcome::Detached(r) => break Ok((0, Some(format!("[qsh: {r}; session {} stays on the server]", hello.session)))),
+            Outcome::Quit => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
             Outcome::Lost(why) => match {
                 crate::paths::log(format!("connection lost: {why}"));
                 reconnect(&sh, &mut link, &mut ev_rx, &mut hello, &mut pending).await
             } {
                 Ok(Some(s)) => streams = s,
-                Ok(None) => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", w.session)))),
+                Ok(None) => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
                 Err(e) => break Err(e),
             },
         }
@@ -287,13 +291,7 @@ async fn drive(
         pending.clear();
     }
 
-    let (net_tx, mut net_rx) = mpsc::unbounded_channel::<Outcome>();
-    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
-    let sh2 = sh.clone();
-    let reader = tokio::spawn(async move {
-        let o = read_loop(&sh2, recv, ack_tx).await;
-        let _ = net_tx.send(o);
-    });
+    let mut reader = Reader::spawn(sh, recv);
     let c2 = conn.clone();
     let sh3 = sh.clone();
     let acceptor = tokio::spawn(async move {
@@ -318,6 +316,7 @@ async fn drive(
     let mut seq: u32 = 0;
     let mut rebound = false;
     let mut shown: Option<u64> = None;
+    let mut status_until: Option<Instant> = None;
     let mut last_probe = Instant::now();
     let mut probing = false;
 
@@ -340,14 +339,47 @@ async fn drive(
                     }
                     Event::Detach => {
                         let _ = send.write_all(&proto::control_frame(&Control::Detach)).await;
-                        match tokio::time::timeout(Duration::from_secs(2), net_rx.recv()).await {
+                        match tokio::time::timeout(Duration::from_secs(2), reader.net_rx.recv()).await {
                             Ok(Some(o @ Outcome::Detached(_))) => break o,
                             _ => break Outcome::Detached("detached".into()),
                         }
                     }
                     Event::Quit => break Outcome::Quit,
                     Event::Help => {
-                        let _ = sh.out.send(Out::Message(HELP.into())).await;
+                        let _ = sh.out.send(Out::Status(Some(HELP.into()))).await;
+                        status_until = Some(Instant::now() + Duration::from_secs(6));
+                    }
+                    Event::Key(k) => {
+                        let list = match rpc_list(&conn).await {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        if k == 'w' {
+                            let names: Vec<String> = list
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| if s.name == hello.session { format!("{i}:[{}]", s.name) } else { format!("{i}:{}", s.name) })
+                                .collect();
+                            let _ = sh.out.send(Out::Status(Some(format!("qsh sessions  {}", names.join("  "))))).await;
+                            status_until = Some(Instant::now() + Duration::from_secs(4));
+                            continue;
+                        }
+                        let Some(target) = pick_session(k, &list, &hello.session) else { continue };
+                        match switch_session(sh, &conn, hello, target).await {
+                            Ok((s2, r2)) => {
+                                reader.task.abort();
+                                let _ = send.write_all(&proto::control_frame(&Control::Detach)).await;
+                                let _ = send.finish();
+                                send = s2;
+                                reader = Reader::spawn(sh, r2);
+                                let _ = sh.out.send(Out::Status(Some(format!("qsh: session {}", hello.session)))).await;
+                                status_until = Some(Instant::now() + Duration::from_secs(2));
+                            }
+                            Err(e) => {
+                                let _ = sh.out.send(Out::Status(Some(format!("qsh: {e:#}")))).await;
+                                status_until = Some(Instant::now() + Duration::from_secs(4));
+                            }
+                        }
                     }
                     Event::Migrate(PathKind::Direct) => {
                         crate::paths::log("signal: move to a new UDP socket");
@@ -364,9 +396,27 @@ async fn drive(
                     }
                 }
             }
-            o = net_rx.recv() => break o.unwrap_or(Outcome::Lost("reader".into())),
-            Some(mut v) = ack_rx.recv() => {
-                while let Ok(x) = ack_rx.try_recv() {
+            o = reader.net_rx.recv() => {
+                let o = o.unwrap_or(Outcome::Lost("reader".into()));
+                if let Outcome::Exit(code) = o {
+                    // The shell of this session ended. Show another session, if any.
+                    let others = rpc_list(&conn).await.unwrap_or_default();
+                    let ended = hello.session.clone();
+                    if let Some(next) = others.iter().find(|s| s.name != ended) {
+                        if let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.name.clone())).await {
+                            send = s2;
+                            reader = Reader::spawn(sh, r2);
+                            let _ = sh.out.send(Out::Status(Some(format!("qsh: session {ended} ended; now in session {}", hello.session)))).await;
+                            status_until = Some(Instant::now() + Duration::from_secs(3));
+                            continue;
+                        }
+                    }
+                    break Outcome::Exit(code);
+                }
+                break o;
+            }
+            Some(mut v) = reader.ack_rx.recv() => {
+                while let Ok(x) = reader.ack_rx.try_recv() {
                     v = x;
                 }
                 if send.write_all(&proto::frame(kind::ACK, &v.to_be_bytes())).await.is_err() {
@@ -388,6 +438,10 @@ async fn drive(
                     let mut d = vec![b'P'];
                     d.extend_from_slice(&seq.to_be_bytes());
                     let _ = conn.send_datagram(d.into());
+                }
+                if status_until.is_some_and(|t| Instant::now() > t) {
+                    status_until = None;
+                    let _ = sh.out.try_send(Out::Status(None));
                 }
                 let idle = last_echo.lock().unwrap().elapsed();
                 if idle > Duration::from_millis(2500) {
@@ -423,7 +477,7 @@ async fn drive(
             }
         }
     };
-    reader.abort();
+    reader.task.abort();
     acceptor.abort();
     echo.abort();
     if shown.is_some() {
@@ -431,6 +485,97 @@ async fn drive(
     }
     conn.close(0u32.into(), b"");
     outcome
+}
+
+struct Reader {
+    task: tokio::task::JoinHandle<()>,
+    net_rx: mpsc::UnboundedReceiver<Outcome>,
+    ack_rx: mpsc::UnboundedReceiver<u64>,
+}
+
+impl Reader {
+    fn spawn(sh: &Arc<Shared>, recv: quinn::RecvStream) -> Reader {
+        let (net_tx, net_rx) = mpsc::unbounded_channel::<Outcome>();
+        let (ack_tx, ack_rx) = mpsc::unbounded_channel::<u64>();
+        let sh = sh.clone();
+        let task = tokio::spawn(async move {
+            let o = read_loop(&sh, recv, ack_tx).await;
+            let _ = net_tx.send(o);
+        });
+        Reader { task, net_rx, ack_rx }
+    }
+}
+
+enum SessionTarget {
+    New,
+    Name(String),
+}
+
+fn pick_session(key: char, list: &[proto::SessionInfo], current: &str) -> Option<SessionTarget> {
+    if key == 'c' {
+        return Some(SessionTarget::New);
+    }
+    if list.is_empty() {
+        return None;
+    }
+    let i = list.iter().position(|s| s.name == current).unwrap_or(0);
+    let n = list.len();
+    let j = match key {
+        'n' => (i + 1) % n,
+        'p' => (i + n - 1) % n,
+        d @ '0'..='9' => d.to_digit(10)? as usize,
+        _ => return None,
+    };
+    list.get(j).filter(|s| s.name != current).map(|s| SessionTarget::Name(s.name.clone()))
+}
+
+async fn rpc_list(conn: &quinn::Connection) -> Result<Vec<proto::SessionInfo>> {
+    let (mut s, mut r) = conn.open_bi().await?;
+    proto::write_msg(&mut s, &proto::Rpc::List).await?;
+    let _ = s.finish();
+    let rep: proto::Reply = tokio::time::timeout(Duration::from_secs(5), proto::read_msg(&mut r)).await??;
+    if !rep.ok {
+        bail!("{}", rep.error.unwrap_or_default());
+    }
+    Ok(rep.sessions)
+}
+
+/// Attach to another session on a new stream of the same connection. On
+/// success, `hello` describes the new session, and the local screen and
+/// scrollback are cleared: the new session brings its own.
+async fn switch_session(
+    sh: &Arc<Shared>,
+    conn: &quinn::Connection,
+    hello: &mut Hello,
+    target: SessionTarget,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let mut h = hello.clone();
+    h.client_id = None;
+    h.token = String::new();
+    h.offset = 0;
+    match target {
+        SessionTarget::New => {
+            h.new = true;
+            h.session.clear();
+        }
+        SessionTarget::Name(n) => {
+            h.new = false;
+            h.session = n;
+        }
+    }
+    let (mut s, mut r) = conn.open_bi().await?;
+    proto::write_msg(&mut s, &proto::Rpc::Attach { hello: h }).await?;
+    let w: Welcome = tokio::time::timeout(Duration::from_secs(10), proto::read_msg(&mut r)).await??;
+    if !w.ok {
+        bail!("{}", w.error.unwrap_or_default());
+    }
+    hello.session = w.session;
+    hello.client_id = Some(w.client_id);
+    hello.token = w.resume_token;
+    hello.new = false;
+    sh.offset.store(0, Ordering::SeqCst);
+    let _ = sh.out.send(Out::Data(b"\x1b[H\x1b[2J\x1b[3J".to_vec())).await;
+    Ok((s, r))
 }
 
 struct ProbeTarget {
@@ -524,7 +669,7 @@ async fn reconnect(
                     ev = ev_rx.recv() => match ev {
                         Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
                         Some(Event::Resize(sz)) => set_size(hello, sz),
-                        Some(Event::Help) | Some(Event::Migrate(_)) => {}
+                        Some(Event::Help) | Some(Event::Migrate(_)) | Some(Event::Key(_)) => {}
                         Some(Event::Quit) | Some(Event::Detach) | None => break None,
                     }
                 }
@@ -562,7 +707,7 @@ async fn reconnect(
                 ev = ev_rx.recv() => match ev {
                     Some(Event::Input(b)) => if pending.len() < 1 << 20 { pending.extend_from_slice(&b) },
                     Some(Event::Resize(sz)) => set_size(hello, sz),
-                    Some(Event::Help) | Some(Event::Migrate(_)) => {}
+                    Some(Event::Help) | Some(Event::Migrate(_)) | Some(Event::Key(_)) => {}
                     Some(Event::Quit) | Some(Event::Detach) | None => return Ok(None),
                 }
             }

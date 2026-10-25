@@ -81,6 +81,8 @@ pub enum Event {
     Quit,
     /// The `Ctrl-^ ?` help request.
     Help,
+    /// Session keys after the prefix: c (new), n, p, w (list), 0-9.
+    Key(char),
     /// Move the connection to another path (SIGUSR1: new UDP socket, SIGUSR2: SSH tunnel).
     Migrate(super::net::PathKind),
 }
@@ -88,6 +90,46 @@ pub enum Event {
 /// Escape prefix: Ctrl-^ (as in mosh). `Ctrl-^ .` quits, `Ctrl-^ d` detaches,
 /// `Ctrl-^ Ctrl-^` sends one Ctrl-^.
 const PREFIX: u8 = 0x1e;
+
+/// A key from the kitty keyboard protocol: `CSI key[:alt...] ; mods[:event] u`.
+#[derive(Debug, PartialEq)]
+struct CsiKey {
+    len: usize,
+    key: u32,
+    alt: Option<u32>,
+    mods: u32,
+    release: bool,
+}
+
+fn parse_csi_u(b: &[u8]) -> Option<CsiKey> {
+    if !b.starts_with(b"\x1b[") {
+        return None;
+    }
+    let end = b.iter().skip(2).position(|c| !(c.is_ascii_digit() || *c == b';' || *c == b':'))? + 2;
+    if b[end] != b'u' {
+        return None;
+    }
+    let body = std::str::from_utf8(&b[2..end]).ok()?;
+    let mut fields = body.split(';');
+    let mut keys = fields.next()?.split(':');
+    let key = keys.next()?.parse().ok()?;
+    let alt = keys.next().and_then(|k| k.parse().ok());
+    let (mods, event) = match fields.next() {
+        Some(m) => {
+            let mut it = m.split(':');
+            (it.next().and_then(|x| x.parse().ok()).unwrap_or(1), it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(1))
+        }
+        None => (1, 1),
+    };
+    Some(CsiKey { len: end + 1, key, alt, mods, release: event == 3 })
+}
+
+/// Ctrl-^ as the kitty protocol reports it: ctrl+shift+6, or ctrl+^.
+fn is_prefix_key(k: &CsiKey) -> bool {
+    let m = k.mods.saturating_sub(1);
+    let ctrl = m & 4 != 0;
+    ctrl && ((k.key == 54 && m & 1 != 0) || k.key == 94 || k.alt == Some(94))
+}
 
 pub fn spawn_stdin(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
@@ -108,20 +150,39 @@ pub fn spawn_stdin(tx: mpsc::UnboundedSender<Event>) {
                 }
             };
             let mut out = Vec::with_capacity(n);
-            for &b in &buf[..n] {
+            let data = &buf[..n];
+            let mut i = 0;
+            while i < data.len() {
+                // One key: a plain byte, or a kitty protocol key event.
+                let (len, ch, is_prefix, release) = match parse_csi_u(&data[i..]) {
+                    Some(k) => {
+                        let ch = char::from_u32(k.key).filter(|_| k.mods <= 1).unwrap_or('\0');
+                        (k.len, ch, is_prefix_key(&k), k.release)
+                    }
+                    None => (1, data[i] as char, data[i] == PREFIX, false),
+                };
+                let raw = &data[i..i + len];
+                i += len;
+                if release {
+                    if !(prefix || is_prefix) {
+                        out.extend_from_slice(raw);
+                    }
+                    continue;
+                }
                 if prefix {
                     prefix = false;
-                    let ev = match b {
-                        b'.' => Some(Event::Quit),
-                        b'd' | 0x04 => Some(Event::Detach),
-                        b'?' => Some(Event::Help),
-                        PREFIX => {
-                            out.push(PREFIX);
+                    let ev = match ch {
+                        '.' => Some(Event::Quit),
+                        'd' | '\x04' => Some(Event::Detach),
+                        '?' => Some(Event::Help),
+                        'c' | 'n' | 'p' | 'w' | '0'..='9' => Some(Event::Key(ch)),
+                        _ if is_prefix => {
+                            out.extend_from_slice(raw);
                             None
                         }
                         _ => {
                             out.push(PREFIX);
-                            out.push(b);
+                            out.extend_from_slice(raw);
                             None
                         }
                     };
@@ -131,10 +192,10 @@ pub fn spawn_stdin(tx: mpsc::UnboundedSender<Event>) {
                         }
                         let _ = tx.send(ev);
                     }
-                } else if b == PREFIX {
+                } else if is_prefix {
                     prefix = true;
                 } else {
-                    out.push(b);
+                    out.extend_from_slice(raw);
                 }
             }
             if !out.is_empty() && tx.send(Event::Input(out)).is_err() {
@@ -324,6 +385,19 @@ impl Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_keys() {
+        let k = parse_csi_u(b"\x1b[54;6uxyz").unwrap();
+        assert_eq!((k.len, k.key, k.mods, k.release), (7, 54, 6, false));
+        assert!(is_prefix_key(&k));
+        assert!(is_prefix_key(&parse_csi_u(b"\x1b[54:94;6:1u").unwrap()));
+        assert!(parse_csi_u(b"\x1b[54;6:3u").unwrap().release);
+        let d = parse_csi_u(b"\x1b[100u").unwrap();
+        assert_eq!((d.key, d.mods), (100, 1));
+        assert!(!is_prefix_key(&d));
+        assert!(parse_csi_u(b"\x1b[A").is_none());
+    }
 
     #[test]
     fn scan_title_and_osc52() {

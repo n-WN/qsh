@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,10 +58,21 @@ enum Start {
     Snapshot(bool),
 }
 
+/// State of one QUIC connection.
+struct ConnCtx {
+    conn: quinn::Connection,
+    /// Set after a successful read-write attach: later streams of this
+    /// connection can attach to (or make) other sessions without a token.
+    trusted: AtomicBool,
+    /// The session that the client shows now (for `qsh cp` paths).
+    current: Mutex<Option<Arc<Session>>>,
+}
+
 struct Attached {
     session: Arc<Session>,
     id: u64,
     epoch: u64,
+    owner: bool,
     start: Start,
     welcome: Welcome,
 }
@@ -219,20 +230,55 @@ impl Daemon {
         let conn = inc.await?;
         self.conns.fetch_add(1, Ordering::SeqCst);
         let _guard = ConnGuard(self.clone());
-        let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
+        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), current: Mutex::new(None) });
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
         let hello: Hello = tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??;
+
+        // Echo datagrams: the client uses them to check the path end to end.
+        let c3 = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = c3.read_datagram().await {
+                let _ = c3.send_datagram(d);
+            }
+        });
+
+        // Other streams: requests, and terminal streams after a session switch.
+        let (d, c) = (self.clone(), ctx.clone());
+        tokio::spawn(async move {
+            while let Ok((s, r)) = c.conn.accept_bi().await {
+                let (d, c) = (d.clone(), c.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = d.serve_stream(c, s, r).await {
+                        eprintln!("qsh daemon: stream: {e:#}");
+                    }
+                });
+            }
+        });
+
+        self.terminal(&ctx, send, recv, hello).await;
+        conn.closed().await;
+        Ok(())
+    }
+
+    /// Run one terminal stream: attach, then send output and take input.
+    async fn terminal(self: &Arc<Self>, ctx: &Arc<ConnCtx>, mut send: quinn::SendStream, mut recv: quinn::RecvStream, hello: Hello) {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
-        let att = match self.attach(&conn, &hello, tx.clone()) {
+        let att = match self.attach(&ctx.conn, &hello, ctx.trusted.load(Ordering::SeqCst), tx.clone()) {
             Ok(a) => a,
             Err(e) => {
                 let w = Welcome { ok: false, error: Some(format!("{e:#}")), ..Default::default() };
-                proto::write_msg(&mut send, &w).await?;
+                let _ = proto::write_msg(&mut send, &w).await;
                 let _ = send.finish();
-                let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
-                return Ok(());
+                return;
             }
         };
-        proto::write_msg(&mut send, &att.welcome).await?;
+        if att.owner {
+            ctx.trusted.store(true, Ordering::SeqCst);
+        }
+        *ctx.current.lock().unwrap() = Some(att.session.clone());
+        if proto::write_msg(&mut send, &att.welcome).await.is_err() {
+            return;
+        }
 
         let writer = tokio::spawn(async move {
             while let Some(b) = rx.recv().await {
@@ -243,28 +289,7 @@ impl Daemon {
             let _ = send.finish();
         });
 
-        // Echo datagrams: the client uses them to check the path end to end.
-        let c3 = conn.clone();
-        tokio::spawn(async move {
-            while let Ok(d) = c3.read_datagram().await {
-                let _ = c3.send_datagram(d);
-            }
-        });
-
-        let sess = att.session.clone();
-        let c2 = conn.clone();
-        tokio::spawn(async move {
-            while let Ok((s, r)) = c2.accept_bi().await {
-                let sess = sess.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = serve_rpc(sess, s, r).await {
-                        eprintln!("qsh daemon: rpc: {e:#}");
-                    }
-                });
-            }
-        });
-
-        let out = tokio::spawn(output_loop(att.session.clone(), conn.clone(), att.id, att.epoch, tx.clone(), att.start));
+        let out = tokio::spawn(output_loop(att.session.clone(), ctx.conn.clone(), att.id, att.epoch, tx.clone(), att.start));
         let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx).await;
         {
             let mut st = att.session.st.lock().unwrap();
@@ -280,11 +305,70 @@ impl Daemon {
         att.session.cv.notify_all();
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+    }
+
+    async fn serve_stream(self: &Arc<Self>, ctx: Arc<ConnCtx>, mut s: quinn::SendStream, mut r: quinn::RecvStream) -> Result<()> {
+        let rpc: Rpc = proto::read_msg(&mut r).await?;
+        let current = ctx.current.lock().unwrap().clone();
+        let cwd = current.map(|s| s.cwd()).unwrap_or_else(paths::home);
+        match rpc {
+            Rpc::Attach { hello } => {
+                self.terminal(&ctx, s, r, hello).await;
+                return Ok(());
+            }
+            Rpc::List => {
+                proto::write_msg(&mut s, &Reply { ok: true, sessions: self.list(), ..Default::default() }).await?;
+            }
+            Rpc::Push { dest, .. } => {
+                let target = resolve(&cwd, &dest);
+                let place = if target.is_dir() { files::Place::Into(target) } else { files::Place::As(target) };
+                let rep = match files::read_archive(&mut r, place).await {
+                    Ok(saved) => Reply { ok: true, saved: saved.iter().map(|p| p.display().to_string()).collect(), ..Default::default() },
+                    Err(e) => Reply::err(format!("{e:#}")),
+                };
+                proto::write_msg(&mut s, &rep).await?;
+            }
+            Rpc::Pull { paths, .. } => {
+                let roots: Vec<PathBuf> = paths.iter().map(|p| resolve(&cwd, p)).collect();
+                if let Some(missing) = roots.iter().find(|p| !p.exists()) {
+                    proto::write_msg(&mut s, &Reply::err(format!("{}: no such file", missing.display()))).await?;
+                } else {
+                    proto::write_msg(&mut s, &Reply::ok()).await?;
+                    files::write_archive(&mut s, &roots).await?;
+                }
+            }
+            _ => proto::write_msg(&mut s, &Reply::err("not supported by the server")).await?,
+        }
+        let _ = s.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(30), s.stopped()).await;
         Ok(())
     }
 
-    fn attach(self: &Arc<Self>, conn: &quinn::Connection, h: &Hello, ctl: mpsc::Sender<Vec<u8>>) -> Result<Attached> {
+    fn list(&self) -> Vec<SessionInfo> {
+        let mut sessions: Vec<SessionInfo> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| {
+                let st = s.st.lock().unwrap();
+                SessionInfo {
+                    name: s.name.clone(),
+                    pid: s.pid,
+                    created: s.created,
+                    command: s.command.clone(),
+                    cols: st.size[0],
+                    rows: st.size[1],
+                    clients: st.clients.len(),
+                    connected: st.clients.values().filter(|c| c.conn.is_some()).count(),
+                }
+            })
+            .collect();
+        sessions.sort_by(|a, b| (a.created, &a.name).cmp(&(b.created, &b.name)));
+        sessions
+    }
+
+    fn attach(self: &Arc<Self>, conn: &quinn::Connection, h: &Hello, trusted: bool, ctl: mpsc::Sender<Vec<u8>>) -> Result<Attached> {
         if h.version != proto::VERSION {
             bail!("protocol version mismatch (client {}, server {})", h.version, proto::VERSION);
         }
@@ -316,6 +400,7 @@ impl Daemon {
                 slot.server_addr = h.server_addr.clone();
             }
             let readonly = slot.readonly;
+            let owner = slot.owner;
             let token = slot.resume_token.clone();
             if st.active == Some(id) {
                 sess.resize(&mut st, [h.cols, h.rows, h.xpix, h.ypix]);
@@ -325,12 +410,15 @@ impl Daemon {
                 session: sess,
                 id,
                 epoch,
+                owner,
                 start: Start::Offset(h.offset),
                 welcome: Welcome { ok: true, client_id: id, resume_token: token, session: name, resumed: true, readonly, ..Default::default() },
             });
         }
 
-        let grant = {
+        let grant = if h.token.is_empty() && trusted {
+            Grant::Bootstrap
+        } else {
             let mut g = self.grants.lock().unwrap();
             g.retain(|_, e| e.expires > Instant::now());
             let found = g.iter().find(|(k, _)| ct_eq(k, &h.token)).map(|(k, _)| k.clone());
@@ -343,6 +431,7 @@ impl Daemon {
                 Grant::Share { session, readonly } => Grant::Share { session: session.clone(), readonly: *readonly },
             }
         };
+        let owner = matches!(grant, Grant::Bootstrap);
         let (readonly, may_create) = match &grant {
             Grant::Bootstrap => (false, true),
             Grant::Share { session, readonly } => {
@@ -352,17 +441,22 @@ impl Daemon {
                 (*readonly, false)
             }
         };
-        let (sess, created) = {
+        let (sess, created, name) = {
             let mut ss = self.sessions.lock().unwrap();
+            let name = if h.new && may_create {
+                (1..).map(|i: u32| i.to_string()).find(|n| !ss.contains_key(n)).unwrap()
+            } else {
+                name
+            };
             match ss.get(&name) {
-                Some(s) => (s.clone(), false),
+                Some(s) => (s.clone(), false, name),
                 None => {
                     if !may_create {
                         bail!("session {name} does not exist");
                     }
                     let s = self.create_session(&name, h)?;
                     ss.insert(name.clone(), s.clone());
-                    (s, true)
+                    (s, true, name)
                 }
             }
         };
@@ -393,6 +487,7 @@ impl Daemon {
             ClientSlot {
                 size: [h.cols, h.rows, h.xpix, h.ypix],
                 readonly,
+                owner,
                 resume_token: token.clone(),
                 conn: Some(conn.clone()),
                 ctl: Some(ctl),
@@ -411,6 +506,7 @@ impl Daemon {
             session: sess,
             id,
             epoch: 1,
+            owner,
             start: if created { Start::Offset(0) } else { Start::Snapshot(true) },
             welcome: Welcome { ok: true, client_id: id, resume_token: token, session: name, created, readonly, ..Default::default() },
         })
@@ -456,27 +552,8 @@ impl Daemon {
                 proto::write_msg(&mut w, &rep).await?;
             }
             LocalReq::List => {
-                let mut sessions: Vec<SessionInfo> = self
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .map(|s| {
-                        let st = s.st.lock().unwrap();
-                        SessionInfo {
-                            name: s.name.clone(),
-                            pid: s.pid,
-                            created: s.created,
-                            command: s.command.clone(),
-                            cols: st.size[0],
-                            rows: st.size[1],
-                            clients: st.clients.len(),
-                            connected: st.clients.values().filter(|c| c.conn.is_some()).count(),
-                        }
-                    })
-                    .collect();
-                sessions.sort_by_key(|s| s.created);
-                proto::write_msg(&mut w, &LocalReply { ok: true, sessions, port: self.port, fp: self.fp.clone(), ..Default::default() }).await?;
+                let rep = LocalReply { ok: true, sessions: self.list(), port: self.port, fp: self.fp.clone(), ..Default::default() };
+                proto::write_msg(&mut w, &rep).await?;
             }
             LocalReq::Rpc { session, rpc } => {
                 let conn = match self.target(&session) {
@@ -702,36 +779,6 @@ pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
     }
     let e = paths::expand_tilde(p);
     if e.is_absolute() { e } else { cwd.join(e) }
-}
-
-/// Requests that a client sends to the server (from `qsh cp` on the client side).
-async fn serve_rpc(sess: Arc<Session>, mut s: quinn::SendStream, mut r: quinn::RecvStream) -> Result<()> {
-    let rpc: Rpc = proto::read_msg(&mut r).await?;
-    match rpc {
-        Rpc::Push { dest, .. } => {
-            let target = resolve(&sess.cwd(), &dest);
-            let place = if target.is_dir() { files::Place::Into(target) } else { files::Place::As(target) };
-            let rep = match files::read_archive(&mut r, place).await {
-                Ok(saved) => Reply { ok: true, saved: saved.iter().map(|p| p.display().to_string()).collect(), ..Default::default() },
-                Err(e) => Reply::err(format!("{e:#}")),
-            };
-            proto::write_msg(&mut s, &rep).await?;
-        }
-        Rpc::Pull { paths, .. } => {
-            let cwd = sess.cwd();
-            let roots: Vec<PathBuf> = paths.iter().map(|p| resolve(&cwd, p)).collect();
-            if let Some(missing) = roots.iter().find(|p| !p.exists()) {
-                proto::write_msg(&mut s, &Reply::err(format!("{}: no such file", missing.display()))).await?;
-            } else {
-                proto::write_msg(&mut s, &Reply::ok()).await?;
-                files::write_archive(&mut s, &roots).await?;
-            }
-        }
-        _ => proto::write_msg(&mut s, &Reply::err("not supported by the server")).await?,
-    }
-    let _ = s.finish();
-    let _ = tokio::time::timeout(Duration::from_secs(30), s.stopped()).await;
-    Ok(())
 }
 
 fn hostname() -> String {

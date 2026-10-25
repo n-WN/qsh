@@ -124,6 +124,9 @@ pub struct ClientSlot {
     /// cols, rows, width and height in pixels
     pub size: [u16; 4],
     pub readonly: bool,
+    /// Attached with the owner's SSH bootstrap token (not a share link). Only
+    /// owners can open or make other sessions on the same connection.
+    pub owner: bool,
     pub resume_token: String,
     pub conn: Option<quinn::Connection>,
     /// Writer channel of the current connection (for control frames).

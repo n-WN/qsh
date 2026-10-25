@@ -48,6 +48,9 @@ struct ConnectArgs {
     /// Session name: attach to it, or make it.
     #[arg(short, long, default_value = "main")]
     session: String,
+    /// Make a new session with a free name.
+    #[arg(short = 'n', long = "new", conflicts_with = "session")]
+    new_session: bool,
     #[command(flatten)]
     ssh: SshArgs,
     /// How QUIC packets travel: direct UDP, through the SSH channel, or auto.
@@ -317,6 +320,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             };
             let download_dir = c.download_dir.clone().unwrap_or_else(|| paths::home().join("Downloads"));
             let mut opts = client::Opts {
+                new_session: c.new_session,
                 ssh: None,
                 direct: None,
                 session: c.session.clone(),

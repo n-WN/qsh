@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 //! The local clipboard, with any data type. On macOS this uses NSPasteboard
 //! directly; elsewhere it calls wl-copy/wl-paste or xclip.
 

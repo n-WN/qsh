@@ -125,6 +125,7 @@ async fn handle(sh: &Arc<Shared>, s: &mut quinn::SendStream, r: &mut quinn::Recv
             open_local(&url)?;
             proto::write_msg(s, &Reply::ok()).await?;
         }
+        Rpc::List | Rpc::Attach { .. } => bail!("not supported by the client"),
     }
     Ok(())
 }

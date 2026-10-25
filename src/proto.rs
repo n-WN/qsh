@@ -114,6 +114,9 @@ pub struct Hello {
     pub command: Vec<String>,
     /// The server address as the client sees it (used for share links).
     pub server_addr: String,
+    /// Make a new session with a free name (ignores `session`).
+    #[serde(default)]
+    pub new: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -160,6 +163,11 @@ pub enum Rpc {
     /// Reply body: archive. `picker`: let the user select files on the client.
     Pull { paths: Vec<String>, picker: bool },
     Open { url: String },
+    /// Client to server: list the sessions.
+    List,
+    /// Client to server: this stream becomes a terminal stream for another
+    /// session (a session switch on the same connection).
+    Attach { hello: Hello },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -173,6 +181,8 @@ pub struct Reply {
     pub types: Vec<String>,
     #[serde(default)]
     pub saved: Vec<String>,
+    #[serde(default)]
+    pub sessions: Vec<SessionInfo>,
 }
 
 impl Reply {

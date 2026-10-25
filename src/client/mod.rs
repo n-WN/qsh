@@ -152,7 +152,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
         eprintln!("qsh: read-only view of session {}", w.session);
     }
 
-    let (out_tx, out_rx) = mpsc::channel::<Out>(64);
+    let (out_tx, out_rx) = mpsc::channel::<Out>(16);
     let sh = Arc::new(Shared {
         conn: Mutex::new(None),
         offset: AtomicU64::new(0),
@@ -221,7 +221,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
     match result {
         Ok((code, msg)) => {
             if let Some(m) = msg {
-                eprintln!("{m}");
+                eprintln!("\r\n{m}");
             }
             Ok(code)
         }
@@ -282,9 +282,10 @@ async fn drive(
     }
 
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<Outcome>();
+    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
     let sh2 = sh.clone();
     let reader = tokio::spawn(async move {
-        let o = read_loop(&sh2, recv).await;
+        let o = read_loop(&sh2, recv, ack_tx).await;
         let _ = net_tx.send(o);
     });
     let c2 = conn.clone();
@@ -362,6 +363,14 @@ async fn drive(
                 }
             }
             o = net_rx.recv() => break o.unwrap_or(Outcome::Lost("reader".into())),
+            Some(mut v) = ack_rx.recv() => {
+                while let Ok(x) = ack_rx.try_recv() {
+                    v = x;
+                }
+                if send.write_all(&proto::frame(kind::ACK, &v.to_be_bytes())).await.is_err() {
+                    break Outcome::Lost("write".into());
+                }
+            }
             Some(ok) = probe_rx.recv() => {
                 probing = false;
                 // UDP works again: move this connection off the SSH tunnel.
@@ -436,7 +445,7 @@ impl ProbeTarget {
     }
 }
 
-async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream) -> Outcome {
+async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::UnboundedSender<u64>) -> Outcome {
     loop {
         let (k, p) = match proto::read_frame(&mut recv).await {
             Ok(Some(f)) => f,
@@ -456,6 +465,7 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream) -> Outcome {
                     return Outcome::Quit;
                 }
                 sh.offset.store(end, Ordering::SeqCst);
+                let _ = ack.send(end);
             }
             kind::SNAPSHOT => {
                 let Ok((off, data)) = proto::split_offset(&p) else { continue };
@@ -463,6 +473,7 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream) -> Outcome {
                     return Outcome::Quit;
                 }
                 sh.offset.store(off, Ordering::SeqCst);
+                let _ = ack.send(off);
             }
             kind::CONTROL => match serde_json::from_slice::<Control>(&p) {
                 Ok(Control::Exit { code }) => return Outcome::Exit(code),

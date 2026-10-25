@@ -14,6 +14,8 @@ pub mod kind {
     pub const INPUT: u8 = 1;
     pub const RESIZE: u8 = 2;
     pub const PING: u8 = 3;
+    /// Output offset that the client gave to its terminal (u64).
+    pub const ACK: u8 = 4;
     // server -> client
     pub const OUTPUT: u8 = 10;
     pub const SNAPSHOT: u8 = 11;

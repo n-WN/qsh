@@ -264,7 +264,7 @@ impl Daemon {
             }
         });
 
-        let out = tokio::spawn(output_loop(att.session.clone(), att.id, att.epoch, tx.clone(), att.start));
+        let out = tokio::spawn(output_loop(att.session.clone(), conn.clone(), att.id, att.epoch, tx.clone(), att.start));
         let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx).await;
         {
             let mut st = att.session.st.lock().unwrap();
@@ -277,6 +277,7 @@ impl Daemon {
             }
         }
         out.abort();
+        att.session.cv.notify_all();
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
@@ -310,6 +311,8 @@ impl Daemon {
             slot.cols = h.cols;
             slot.rows = h.rows;
             slot.gone_since = None;
+            slot.acked = h.offset;
+            slot.ack_at = Instant::now();
             if !h.server_addr.is_empty() {
                 slot.server_addr = h.server_addr.clone();
             }
@@ -385,6 +388,7 @@ impl Daemon {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let token = paths::random_hex(32);
         let mut st = sess.st.lock().unwrap();
+        let acked = if created { 0 } else { st.ring.head() };
         st.clients.insert(
             id,
             ClientSlot {
@@ -397,6 +401,8 @@ impl Daemon {
                 epoch: 1,
                 gone_since: None,
                 server_addr: h.server_addr.clone(),
+                acked,
+                ack_at: Instant::now(),
             },
         );
         if !readonly {
@@ -541,8 +547,21 @@ impl Daemon {
     }
 }
 
-async fn output_loop(sess: Arc<Session>, id: u64, epoch: u64, tx: mpsc::Sender<Vec<u8>>, start: Start) {
+enum Next {
+    Frame(Vec<u8>),
+    Wait,
+    Exit(i32),
+}
+
+/// Flow window for one connection: about two congestion windows, so the
+/// network stays busy, but little output waits in buffers.
+fn window(conn: &quinn::Connection) -> u64 {
+    (2 * conn.stats().path.cwnd).clamp(256 << 10, 4 << 20)
+}
+
+async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch: u64, tx: mpsc::Sender<Vec<u8>>, start: Start) {
     let mut head_rx = sess.head.subscribe();
+    let mut ack_rx = sess.ack.subscribe();
     let mut exit_rx = sess.exit.subscribe();
     let (mut off, mut snap) = match start {
         Start::Offset(o) => (o, None),
@@ -550,46 +569,58 @@ async fn output_loop(sess: Arc<Session>, id: u64, epoch: u64, tx: mpsc::Sender<V
     };
     loop {
         head_rx.borrow_and_update();
-        let item = {
+        ack_rx.borrow_and_update();
+        let win = window(&conn);
+        let next = {
             let mut st = sess.st.lock().unwrap();
-            match st.clients.get(&id) {
-                Some(c) if c.epoch == epoch => {}
+            let acked = match st.clients.get(&id) {
+                Some(c) if c.epoch == epoch => c.acked,
                 _ => return,
-            }
+            };
             let head = st.ring.head();
             if let Some(full) = snap.take() {
                 let b = st.snapshot(full);
                 off = head;
-                Some(proto::frame_at(kind::SNAPSHOT, head, &b))
+                Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
             } else if off < st.ring.base() || off > head || head - off > LAG_LIMIT {
                 let b = st.snapshot(false);
                 off = head;
-                Some(proto::frame_at(kind::SNAPSHOT, head, &b))
+                Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
             } else if off < head {
-                let d = st.ring.read(off, CHUNK).unwrap_or_default();
-                let f = proto::frame_at(kind::OUTPUT, off, &d);
-                off += d.len() as u64;
-                Some(f)
+                let inflight = off.saturating_sub(acked);
+                if inflight >= win {
+                    Next::Wait
+                } else {
+                    let n = (CHUNK as u64).min(win - inflight) as usize;
+                    let d = st.ring.read(off, n).unwrap_or_default();
+                    let f = proto::frame_at(kind::OUTPUT, off, &d);
+                    off += d.len() as u64;
+                    Next::Frame(f)
+                }
+            } else if let Some(code) = *exit_rx.borrow_and_update() {
+                Next::Exit(code)
             } else {
-                None
+                Next::Wait
             }
         };
-        match item {
-            Some(f) => {
+        match next {
+            Next::Frame(f) => {
                 if tx.send(f).await.is_err() {
                     return;
                 }
             }
-            None => {
-                let code = *exit_rx.borrow_and_update();
-                if let Some(code) = code {
-                    let _ = tx.send(proto::control_frame(&Control::Exit { code })).await;
-                    return;
-                }
+            Next::Exit(code) => {
+                let _ = tx.send(proto::control_frame(&Control::Exit { code })).await;
+                return;
+            }
+            Next::Wait => {
                 tokio::select! {
                     r = head_rx.changed() => if r.is_err() { return },
+                    r = ack_rx.changed() => if r.is_err() { return },
                     _ = exit_rx.changed() => {},
                     _ = tx.closed() => return,
+                    // The congestion window can grow without an event.
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {},
                 }
             }
         }
@@ -634,6 +665,20 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
                 if st.active == Some(id) {
                     sess.resize(&mut st, cols, rows);
                 }
+            }
+            kind::ACK if p.len() >= 8 => {
+                let v = u64::from_be_bytes(p[..8].try_into().unwrap());
+                {
+                    let mut st = sess.st.lock().unwrap();
+                    if let Some(slot) = st.clients.get_mut(&id) {
+                        if v > slot.acked {
+                            slot.acked = v;
+                            slot.ack_at = Instant::now();
+                        }
+                    }
+                }
+                sess.cv.notify_all();
+                sess.ack.send_modify(|x| *x = x.wrapping_add(1));
             }
             kind::PING => {
                 let _ = tx.try_send(proto::frame(kind::PONG, &p));

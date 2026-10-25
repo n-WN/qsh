@@ -11,8 +11,8 @@ use std::{
     num::NonZeroU16,
     os::fd::OwnedFd,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Instant,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -22,6 +22,12 @@ use super::pty;
 
 pub const RING_CAP: usize = 8 << 20;
 pub const SCROLLBACK: usize = 5000;
+/// Stop reading the pty while the active client is this far behind. The program
+/// then blocks on write, as with ssh, and on Ctrl-C the kernel discards the pty
+/// output queue: no output is lost, and little output is in flight.
+pub const PAUSE_LIMIT: u64 = 1 << 20;
+/// A paused pty starts again if the active client stops acknowledging.
+const PAUSE_MAX: Duration = Duration::from_secs(5);
 
 pub struct Ring {
     buf: VecDeque<u8>,
@@ -126,6 +132,9 @@ pub struct ClientSlot {
     pub epoch: u64,
     pub gone_since: Option<Instant>,
     pub server_addr: String,
+    /// Output offset that the client acknowledged, and when it last moved.
+    pub acked: u64,
+    pub ack_at: Instant,
 }
 
 pub struct State {
@@ -145,7 +154,11 @@ pub struct Session {
     master: OwnedFd,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     pub st: Mutex<State>,
+    /// Signalled when an acknowledgement arrives (wakes the paused pty reader).
+    pub cv: Condvar,
     pub head: watch::Sender<u64>,
+    /// Changes on each acknowledgement (wakes output loops).
+    pub ack: watch::Sender<u64>,
     pub exit: watch::Sender<Option<i32>>,
 }
 
@@ -183,7 +196,9 @@ impl Session {
                 cols,
                 rows,
             }),
+            cv: Condvar::new(),
             head: watch::Sender::new(0),
+            ack: watch::Sender::new(0),
             exit: watch::Sender::new(None),
         });
 
@@ -202,6 +217,12 @@ impl Session {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
+                {
+                    let mut st = s.st.lock().unwrap();
+                    while st.output_blocked() {
+                        st = s.cv.wait_timeout(st, Duration::from_millis(100)).unwrap().0;
+                    }
+                }
                 match nix::unistd::read(&reader, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -285,6 +306,12 @@ const RESET_MODES: &str = concat!(
 );
 
 impl State {
+    /// True while the active, connected client is too far behind.
+    pub fn output_blocked(&self) -> bool {
+        let Some(c) = self.active.and_then(|id| self.clients.get(&id)) else { return false };
+        c.conn.is_some() && self.ring.head().saturating_sub(c.acked) > PAUSE_LIMIT && c.ack_at.elapsed() < PAUSE_MAX
+    }
+
     /// Escape sequences that bring a terminal to the current screen state.
     /// `full`: also send the scrollback (for a client that has nothing yet).
     pub fn snapshot(&mut self, full: bool) -> Vec<u8> {
@@ -333,7 +360,12 @@ fn flow(out: &mut String, screen: &vt100::Screen, scrollback: bool) {
         vt100::capture::BasicFormattedCaptureRange::Visible
     };
     let _ = screen.write_contents_formatted_basic(&mut s, range);
-    out.push_str("\x1b[0m\r\n");
+    // Scroll the old screen into the terminal's scrollback, so that no old text
+    // stays at the end of new, shorter lines. Then print from a blank screen.
+    let rows = screen.size().0.get() as usize;
+    out.push_str(&format!("\x1b[0m\x1b[{rows};1H"));
+    out.push_str(&"\n".repeat(rows));
+    out.push_str("\x1b[H");
     out.push_str(&s.replace('\n', "\r\n"));
     out.push_str("\x1b[0m");
 }
@@ -399,11 +431,30 @@ mod tests {
         q.process(&snap);
         assert_eq!(q.screen().contents(), st.parser.screen().contents());
         assert_eq!(q.screen().cursor_position(), st.parser.screen().cursor_position());
-        q.screen_mut().set_scrollback(100);
-        assert!(q.screen().contents().contains("line 0"));
+        let n = q.screen().scrollback_len();
+        let found = (0..=n).any(|off| {
+            q.screen_mut().set_scrollback(off);
+            q.screen().contents().contains("line 0")
+        });
+        assert!(found);
         let s = String::from_utf8_lossy(&snap);
         assert!(s.contains("\x1b[>1u"));
         assert!(s.contains("\x1b]2;hello\x07"));
+    }
+
+    #[test]
+    fn catch_up_snapshot_leaves_no_old_text() {
+        let mut p = vt100::Parser::new_with_callbacks(nz(4), nz(20), 100, Tracker::default());
+        p.process(b"a\r\nb\r\n$ ");
+        let mut st = State { ring: Ring::new(10), parser: p, clients: BTreeMap::new(), active: None, cols: 20, rows: 4 };
+        let snap = st.snapshot(false);
+        let mut q = vt100::Parser::new(nz(4), nz(20), 100);
+        q.process(b"XXXXXXXXXXXXXXXXXXXX\r\nYYYYYYYYYYYYYYYYYYYY\r\nZZZZ\x1b[2;5H");
+        q.process(&snap);
+        assert_eq!(q.screen().contents(), st.parser.screen().contents());
+        assert_eq!(q.screen().cursor_position(), st.parser.screen().cursor_position());
+        q.screen_mut().set_scrollback(100);
+        assert!(q.screen().contents().contains("XXXX"));
     }
 
     #[test]

@@ -48,12 +48,11 @@ pub fn enter_raw() -> std::io::Result<()> {
 /// Leave raw mode and undo modes that a remote program can leave on.
 pub fn restore() {
     if let Some(t) = SAVED.lock().unwrap().take() {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(
-            b"\x1b[0m\x1b[?1049l\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<99u\x1b[r",
-        );
-        let _ = out.flush();
+        // Write to fd 1 directly: the output thread can hold the stdout lock.
+        let reset: &[u8] =
+            b"\x1b[0m\x1b[?1049l\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<99u\x1b7\x1b[r\x1b8";
         unsafe {
+            libc::write(1, reset.as_ptr() as *const libc::c_void, reset.len());
             libc::tcsetattr(0, libc::TCSADRAIN, &t);
         }
     }
@@ -141,10 +140,10 @@ pub enum Out {
 
 pub fn spawn_stdout(mut rx: mpsc::Receiver<Out>, osc52: bool) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut out = std::io::stdout().lock();
         let mut scan = Scan::default();
         let mut status_shown = false;
         while let Some(m) = rx.blocking_recv() {
+            let mut out = std::io::stdout().lock();
             match m {
                 Out::Data(d) => {
                     scan.feed(&d, |code, body| {

@@ -20,8 +20,29 @@ pub mod kind {
     pub const OUTPUT: u8 = 10;
     pub const SNAPSHOT: u8 = 11;
     pub const PONG: u8 = 12;
+    /// Input processed: u64 count of input bytes from this client that the
+    /// program has had for some time (output up to here includes the echo),
+    /// then u8 pty mode (`mode::*`).
+    pub const INPUT_ACK: u8 = 13;
+    /// The pty size from here on in the stream: u16 cols, u16 rows, u8 flags
+    /// (`SIZE_MINE`: this client sets the size).
+    pub const SIZE: u8 = 14;
     // both directions, JSON payload
     pub const CONTROL: u8 = 20;
+}
+
+pub const SIZE_MINE: u8 = 1;
+
+/// Bits of the pty mode in INPUT_ACK.
+pub mod mode {
+    /// The mode is known.
+    pub const KNOWN: u8 = 0x80;
+    /// The kernel echoes input.
+    pub const ECHO: u8 = 1;
+    /// Line mode (the kernel edits lines).
+    pub const ICANON: u8 = 2;
+    /// The foreground program is a shell (its line editor echoes input).
+    pub const SHELL: u8 = 4;
 }
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -133,6 +154,11 @@ pub struct Welcome {
     pub created: bool,
     pub resumed: bool,
     pub readonly: bool,
+    /// Bytes of input from this client that the server has received (all
+    /// connections). The client sends again what came after. None from old
+    /// servers.
+    #[serde(default)]
+    pub input_seen: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -208,6 +234,8 @@ pub enum LocalReq {
     Rpc { session: String, rpc: Rpc },
     Detach { session: String },
     Share { session: String, readonly: bool, ttl: u64 },
+    /// Replace the daemon process with `exe`; sessions and clients stay.
+    Upgrade { exe: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -225,6 +253,9 @@ pub struct LocalReply {
     pub url: String,
     #[serde(default)]
     pub sessions: Vec<SessionInfo>,
+    /// The daemon's build ("ID:TIME").
+    #[serde(default)]
+    pub build: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

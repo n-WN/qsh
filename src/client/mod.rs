@@ -3,11 +3,15 @@
 
 pub mod clipboard;
 pub mod drop;
+pub mod install;
 pub mod net;
+pub mod predict;
 pub mod rpc;
+pub mod screen;
 pub mod term;
 
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -21,8 +25,10 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::mpsc;
 
 use crate::proto::{self, Control, Hello, Welcome, kind};
+use crate::version::Build;
 use net::{Candidate, Link, PathKind, SshSpec, Transport};
-use term::{Event, Out, Overlay};
+use screen::{Out, Overlay};
+use term::Event;
 
 pub struct Opts {
     pub new_session: bool,
@@ -36,14 +42,74 @@ pub struct Opts {
     pub policy: rpc::Policy,
     pub osc52: bool,
     pub verbose: bool,
+    pub predict: Predict,
+    /// Install or upgrade qsh on the server when needed.
+    pub install: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Predict {
+    /// When the round trip is long or the link stalls.
+    Auto,
+    Always,
+    Never,
+}
+
+/// Input sent to the server and not yet acknowledged, counted from the first
+/// byte of this client identity. On a new connection the server tells how much
+/// it has; the rest goes again. No key is lost or sent twice.
+#[derive(Default)]
+pub struct InputLog {
+    sent: u64,
+    base: u64,
+    buf: VecDeque<u8>,
+}
+
+impl InputLog {
+    const LIMIT: usize = 4 << 20;
+
+    /// Returns the count after these bytes.
+    fn push(&mut self, b: &[u8]) -> u64 {
+        self.buf.extend(b);
+        self.sent += b.len() as u64;
+        if self.buf.len() > Self::LIMIT {
+            let n = self.buf.len() - Self::LIMIT;
+            self.buf.drain(..n);
+            self.base += n as u64;
+        }
+        self.sent
+    }
+
+    fn ack(&mut self, n: u64) {
+        if n > self.base {
+            let k = ((n - self.base) as usize).min(self.buf.len());
+            self.buf.drain(..k);
+            self.base += k as u64;
+        }
+    }
+
+    /// The bytes after `seen`.
+    fn since(&self, seen: u64) -> Vec<u8> {
+        let from = seen.max(self.base);
+        if from >= self.sent {
+            return Vec::new();
+        }
+        self.buf.iter().skip((from - self.base) as usize).copied().collect()
+    }
+
+    fn reset(&mut self) {
+        *self = InputLog::default();
+    }
 }
 
 pub struct Shared {
     pub conn: Mutex<Option<quinn::Connection>>,
     pub offset: AtomicU64,
+    pub input: Mutex<InputLog>,
     pub out: mpsc::Sender<Out>,
     pub policy: rpc::Policy,
     pub download_dir: PathBuf,
+    pub predict: Predict,
 }
 
 enum Outcome {
@@ -62,7 +128,8 @@ enum Fail {
     Unknown,
 }
 
-type Streams = (quinn::Connection, quinn::SendStream, quinn::RecvStream);
+/// A connection, its terminal stream, and input to send first (again).
+type Streams = (quinn::Connection, quinn::SendStream, quinn::RecvStream, Vec<u8>);
 
 const HELP: &[&str] = &[
     "qsh · keys after Ctrl-^",
@@ -193,6 +260,42 @@ async fn handshake(conn: &quinn::Connection, hello: &Hello) -> std::result::Resu
     Ok((s, r, w))
 }
 
+/// Start `qsh helper` over SSH. Install or upgrade qsh on the server first if
+/// it is missing or older than this client.
+async fn bootstrap(opts: &Opts, spec: &SshSpec) -> Result<net::Helper> {
+    let want_tunnel = opts.transport != Transport::Udp;
+    let may_install = opts.install && spec.server_path.is_none();
+    let mut installed = false;
+    loop {
+        match net::spawn_helper(spec, want_tunnel, true, false).await {
+            Ok(h) => {
+                let older = h.line.build.as_ref().is_none_or(|b| Build::current().replaces(b));
+                if !older || !may_install || installed {
+                    return Ok(h);
+                }
+                let platform = match &h.line.platform {
+                    Some(p) => p.clone(),
+                    None => install::remote_platform(spec).await?,
+                };
+                drop(h);
+                installed = true;
+                // A failure is not fatal here: the older qsh still works.
+                if let Err(e) = install::install(spec, &platform, "the server has an older qsh").await {
+                    eprintln!("qsh: {e:#}");
+                }
+            }
+            Err(e) => match e.downcast_ref::<net::Missing>() {
+                Some(m) if may_install && !installed => {
+                    let platform = m.0.clone();
+                    installed = true;
+                    install::install(spec, &platform, "qsh is not on the server").await?;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
 pub async fn run(opts: Opts) -> Result<i32> {
     if !term::is_tty() {
         bail!("qsh needs a terminal on stdin and stdout");
@@ -204,7 +307,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
     // token. Then QUIC over UDP and QUIC through the same SSH connection race.
     let (mut link, token, conn) = if let Some(spec) = &opts.ssh {
         let want_tunnel = opts.transport != Transport::Udp;
-        let helper = net::spawn_helper(spec, want_tunnel, true, false).await?;
+        let helper = bootstrap(&opts, spec).await?;
         let addr = net::resolve(spec, helper.line.port).await?;
         let fp = helper.line.fp.clone();
         let token = helper.line.token.clone().ok_or_else(|| anyhow!("no token from the server"))?;
@@ -260,28 +363,30 @@ pub async fn run(opts: Opts) -> Result<i32> {
         eprintln!("qsh: read-only view of session {}", w.session);
     }
 
-    let (out_tx, out_rx) = mpsc::channel::<Out>(16);
+    let (out_tx, out_rx) = mpsc::channel::<Out>(64);
     let sh = Arc::new(Shared {
         conn: Mutex::new(None),
         offset: AtomicU64::new(0),
+        input: Mutex::new(InputLog::default()),
         out: out_tx,
         policy: opts.policy.clone(),
         download_dir: opts.download_dir.clone(),
+        predict: opts.predict,
     });
     let ctl_path = rpc::spawn_ctl(sh.clone()).ok();
 
     term::enter_raw()?;
     // Scroll only the lines with content into the scrollback, then start from
     // a blank screen: the output thread's mirror starts blank too.
-    let (pos, typed) = term::query_cursor(Duration::from_millis(400));
+    let (pos, typed) = screen::query_cursor(Duration::from_millis(400));
     {
         use std::io::Write;
         let mut o = std::io::stdout().lock();
-        let _ = o.write_all(&term::prepare_screen(size.rows, pos));
+        let _ = o.write_all(&screen::prepare_screen(size.rows, pos));
         let _ = o.flush();
     }
-    let out_thread = term::spawn_stdout(out_rx, opts.osc52, size.cols, size.rows);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
+    let out_thread = screen::spawn_stdout(out_rx, opts.osc52, opts.predict != Predict::Never, size.cols, size.rows, ev_tx.clone());
     term::spawn_stdin(ev_tx.clone());
     for (sig, kind) in [(libc::SIGUSR1, PathKind::Direct), (libc::SIGUSR2, PathKind::Tunnel)] {
         let tx = ev_tx.clone();
@@ -303,13 +408,14 @@ pub async fn run(opts: Opts) -> Result<i32> {
         }
     });
 
-    let mut pending = typed;
+    // Keys typed before the session started.
+    sh.input.lock().unwrap().push(&typed);
     let mut ui = Ui::default();
-    let mut streams: Streams = (conn, send, recv);
+    let mut streams: Streams = (conn, send, recv, typed);
     let result = loop {
-        let (conn, send, recv) = streams;
+        let (conn, send, recv, resend) = streams;
         *sh.conn.lock().unwrap() = Some(conn.clone());
-        let o = drive(&sh, &mut link, conn, send, recv, &mut ev_rx, &mut hello, &mut pending, &mut ui).await;
+        let o = drive(&sh, &mut link, conn, send, recv, resend, &mut ev_rx, &mut hello, &mut ui).await;
         *sh.conn.lock().unwrap() = None;
         match o {
             Outcome::Moved(s) => streams = s,
@@ -318,7 +424,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
             Outcome::Quit => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
             Outcome::Lost(why) => {
                 crate::paths::log(format!("connection lost: {why}"));
-                match reconnect(&sh, &mut link, &mut ev_rx, &mut hello, &mut pending, &mut ui).await {
+                match reconnect(&sh, &mut link, &mut ev_rx, &mut hello, &mut ui).await {
                     Ok(Some(s)) => streams = s,
                     Ok(None) => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
                     Err(e) => break Err(e),
@@ -351,6 +457,22 @@ pub async fn run(opts: Opts) -> Result<i32> {
     }
 }
 
+/// Input to send again on a new connection: what the server has not received.
+fn resend_after(sh: &Shared, w: &Welcome) -> Vec<u8> {
+    w.input_seen.map(|seen| sh.input.lock().unwrap().since(seen)).unwrap_or_default()
+}
+
+/// Send keys to the server. They are in the input log first: if the write
+/// fails, they go again on the next connection.
+async fn send_input(sh: &Shared, send: &mut quinn::SendStream, b: &[u8]) -> bool {
+    if b.is_empty() {
+        return true;
+    }
+    let end = sh.input.lock().unwrap().push(b);
+    let _ = sh.out.try_send(Out::Typed { data: b.to_vec(), end });
+    send.write_all(&proto::frame(kind::INPUT, b)).await.is_ok()
+}
+
 fn info_lines(conn: &quinn::Connection, link: &Link, hello: &Hello) -> Vec<(String, bool)> {
     let st = conn.stats().path;
     let loss = if st.sent_packets > 0 { 100.0 * st.lost_packets as f64 / st.sent_packets as f64 } else { 0.0 };
@@ -374,20 +496,18 @@ async fn drive(
     conn: quinn::Connection,
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
+    resend: Vec<u8>,
     ev_rx: &mut mpsc::UnboundedReceiver<Event>,
     hello: &mut Hello,
-    pending: &mut Vec<u8>,
     ui: &mut Ui,
 ) -> Outcome {
     let size = term::Size { cols: hello.cols, rows: hello.rows, xpix: hello.xpix, ypix: hello.ypix };
     if send.write_all(&proto::frame(kind::RESIZE, &size.encode())).await.is_err() {
         return Outcome::Lost("write".into());
     }
-    if !pending.is_empty() {
-        if send.write_all(&proto::frame(kind::INPUT, pending)).await.is_err() {
-            return Outcome::Lost("write".into());
-        }
-        pending.clear();
+    // Keys that the server does not have yet (they are in the input log).
+    if !resend.is_empty() && send.write_all(&proto::frame(kind::INPUT, &resend)).await.is_err() {
+        return Outcome::Lost("write".into());
     }
 
     let mut reader = Reader::spawn(sh, recv);
@@ -420,6 +540,7 @@ async fn drive(
     let mut racing = false;
     let mut last_probe = Instant::now() - Duration::from_secs(25);
     let mut probing = false;
+    let mut predict_sent = (false, u128::MAX);
 
     let outcome = loop {
         tokio::select! {
@@ -436,15 +557,13 @@ async fn drive(
                                 q.extend_from_slice(&b);
                                 upload = None;
                                 ui.note("qsh ⇪ upload stopped", true, 3);
-                                if send.write_all(&proto::frame(kind::INPUT, &q)).await.is_err() {
-                                    pending.extend_from_slice(&q);
+                                if !send_input(sh, &mut send, &q).await {
                                     break Outcome::Lost("write".into());
                                 }
                             } else {
                                 u.queued.extend_from_slice(&b);
                             }
-                        } else if send.write_all(&proto::frame(kind::INPUT, &b)).await.is_err() {
-                            pending.extend_from_slice(&b);
+                        } else if !send_input(sh, &mut send, &b).await {
                             break Outcome::Lost("write".into());
                         }
                     }
@@ -467,8 +586,7 @@ async fn drive(
                             let b = drop::wrap(&p);
                             if let Some(u) = &mut upload {
                                 u.queued.extend_from_slice(&b);
-                            } else if send.write_all(&proto::frame(kind::INPUT, &b)).await.is_err() {
-                                pending.extend_from_slice(&b);
+                            } else if !send_input(sh, &mut send, &b).await {
                                 break Outcome::Lost("write".into());
                             }
                         }
@@ -522,6 +640,17 @@ async fn drive(
                             Err(e) => ui.note(format!("qsh: {e:#}"), true, 4),
                         }
                     }
+                    Event::View(Some((c, r))) => {
+                        ui.panel(
+                            vec![
+                                (format!("qsh · another client sets the size ({c}×{r})"), false),
+                                ("      type to use the size of this window".to_string(), false),
+                            ],
+                            6,
+                            true,
+                        );
+                    }
+                    Event::View(None) => {}
                     Event::Migrate(PathKind::Direct) => {
                         crate::paths::log("signal: move to a new UDP socket");
                         let _ = link.use_direct();
@@ -581,13 +710,13 @@ async fn drive(
                         let mut h = hello.clone();
                         h.offset = sh.offset.load(Ordering::SeqCst);
                         match handshake(&cand.conn, &h).await {
-                            Ok((s2, r2, _)) => {
+                            Ok((s2, r2, w)) => {
                                 crate::paths::log(format!("moved to a new connection ({:?}) at offset {}", cand.kind, h.offset));
                                 let c2 = link.adopt(cand);
                                 ui.badge(None);
                                 ui.note(format!("qsh ✓ back · {}", link.path_name()), false, 2);
                                 ui.push(&sh.out);
-                                break Outcome::Moved((c2, s2, r2));
+                                break Outcome::Moved((c2, s2, r2, resend_after(sh, &w)));
                             }
                             Err(Fail::Retry(_)) => {}
                             Err(_) => break Outcome::Lost("new connection refused".into()),
@@ -611,14 +740,14 @@ async fn drive(
                     };
                     b.extend_from_slice(&u.queued);
                     ui.push(&sh.out);
-                    if send.write_all(&proto::frame(kind::INPUT, &b)).await.is_err() {
-                        pending.extend_from_slice(&b);
+                    if !send_input(sh, &mut send, &b).await {
                         break Outcome::Lost("write".into());
                     }
                 }
             }
             _ = tick.tick() => {
                 ui.tick();
+                let _ = sh.out.try_send(Out::Tick);
                 if last_ping.elapsed() >= Duration::from_millis(1000) {
                     last_ping = Instant::now();
                     seq = seq.wrapping_add(1);
@@ -632,6 +761,16 @@ async fn drive(
                     ui.panel(vec![(format!("qsh ⇪ {} · {pct}% of {} · Ctrl-C stops", u.name, human(u.total)), false)], 2, false);
                 }
                 let idle = last_echo.lock().unwrap().elapsed();
+                let rtt = conn.rtt();
+                let show = match sh.predict {
+                    Predict::Always => true,
+                    Predict::Never => false,
+                    Predict::Auto => rtt >= Duration::from_millis(30) || idle > Duration::from_millis(1500),
+                };
+                if (show, rtt.as_millis() / 10) != predict_sent {
+                    predict_sent = (show, rtt.as_millis() / 10);
+                    let _ = sh.out.try_send(Out::Predict { show, rtt });
+                }
                 if idle > Duration::from_millis(2500) {
                     ui.badge(Some("qsh ↻ no reply from the server"));
                 } else if idle < Duration::from_secs(1) {
@@ -672,9 +811,12 @@ async fn drive(
     acceptor.abort();
     echo.abort();
     if let Some(u) = upload {
+        // The paste (not uploaded) and the keys after it go on the next connection.
         u.task.abort();
-        pending.extend_from_slice(&drop::wrap(&u.original));
-        pending.extend_from_slice(&u.queued);
+        let mut b = drop::wrap(&u.original);
+        b.extend_from_slice(&u.queued);
+        let end = sh.input.lock().unwrap().push(&b);
+        let _ = sh.out.try_send(Out::Typed { data: b, end });
     }
     conn.close(0u32.into(), b"");
     outcome
@@ -769,6 +911,8 @@ async fn switch_session(
     hello.token = w.resume_token;
     hello.new = false;
     sh.offset.store(0, Ordering::SeqCst);
+    sh.input.lock().unwrap().reset();
+    let _ = sh.out.send(Out::NewClient).await;
     // Leave the alternate screen first: the snapshot starts on the main screen.
     let _ = sh.out.send(Out::Data(b"\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J".to_vec())).await;
     Ok((s, r))
@@ -818,6 +962,20 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::Unbounde
                 sh.offset.store(off, Ordering::SeqCst);
                 let _ = ack.send(off);
             }
+            kind::SIZE if p.len() >= 5 => {
+                let v = |i: usize| u16::from_be_bytes([p[i], p[i + 1]]);
+                let mine = p[4] & proto::SIZE_MINE != 0;
+                if sh.out.send(Out::Size { cols: v(0), rows: v(2), mine }).await.is_err() {
+                    return Outcome::Quit;
+                }
+            }
+            kind::INPUT_ACK if p.len() >= 9 => {
+                let n = u64::from_be_bytes(p[..8].try_into().unwrap());
+                sh.input.lock().unwrap().ack(n);
+                if sh.out.send(Out::InputAck { n, mode: p[8] }).await.is_err() {
+                    return Outcome::Quit;
+                }
+            }
             kind::CONTROL => match serde_json::from_slice::<Control>(&p) {
                 Ok(Control::Exit { code }) => return Outcome::Exit(code),
                 Ok(Control::Detached { reason }) => return Outcome::Detached(reason),
@@ -829,23 +987,29 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::Unbounde
     }
 }
 
-/// Wait for an event while disconnected. Returns false when the user quits.
-fn offline_event(ev: Option<Event>, sh: &Shared, hello: &mut Hello, pending: &mut Vec<u8>) -> bool {
-    match ev {
-        Some(Event::Input(b)) => {
-            if pending.len() < 1 << 20 {
-                pending.extend_from_slice(&b);
-            }
-        }
-        Some(Event::Paste(p)) => pending.extend_from_slice(&drop::wrap(&p)),
+/// An event while disconnected. Keys go into the input log (and show as
+/// predictions); they go to the server on the new connection. Returns false
+/// when the user quits.
+fn offline_event(ev: Option<Event>, sh: &Shared, hello: &mut Hello) -> bool {
+    let keys = match ev {
+        Some(Event::Input(b)) => b,
+        Some(Event::Paste(p)) => drop::wrap(&p),
         Some(Event::Resize(sz)) => {
             set_size(hello, sz);
             let _ = sh.out.try_send(Out::Resize(sz.cols, sz.rows));
+            return true;
         }
-        Some(Event::Help) | Some(Event::Migrate(_)) | Some(Event::Key(_)) => {}
+        Some(Event::Help) | Some(Event::Migrate(_)) | Some(Event::Key(_)) | Some(Event::View(_)) => return true,
         Some(Event::Quit) | Some(Event::Detach) | None => return false,
-    }
+    };
+    let end = sh.input.lock().unwrap().push(&keys);
+    let _ = sh.out.try_send(Out::Typed { data: keys, end });
     true
+}
+
+fn reconnect_badge(start: Instant) -> String {
+    let secs = start.elapsed().as_secs() / 5 * 5;
+    if secs == 0 { "qsh ↻ reconnecting".to_string() } else { format!("qsh ↻ reconnecting · {secs}s") }
 }
 
 async fn reconnect(
@@ -853,17 +1017,16 @@ async fn reconnect(
     link: &mut Link,
     ev_rx: &mut mpsc::UnboundedReceiver<Event>,
     hello: &mut Hello,
-    pending: &mut Vec<u8>,
     ui: &mut Ui,
 ) -> Result<Option<Streams>> {
     let start = Instant::now();
+    // A quick reconnect (a daemon upgrade, a closed connection) shows nothing.
+    let quiet_until = if ui.badge.is_some() { start } else { start + Duration::from_secs(1) };
     let mut attempt: u32 = 0;
     let mut fresh_token: Option<String> = None;
+    let mut badge_tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         attempt += 1;
-        let secs = start.elapsed().as_secs() / 5 * 5;
-        ui.badge(Some(&if secs == 0 { "qsh ↻ reconnecting".to_string() } else { format!("qsh ↻ reconnecting · {secs}s") }));
-        ui.push(&sh.out);
         let mut h = hello.clone();
         h.offset = sh.offset.load(Ordering::SeqCst);
         h.clean = false;
@@ -872,55 +1035,92 @@ async fn reconnect(
             h.token = t.clone();
         }
         let rs = link.race_spec();
-        let res = {
-            let fut = async {
-                let cand = net::race(rs, None, Duration::from_millis(300)).await.map_err(Fail::Retry)?;
-                let (s, r, w) = handshake(&cand.conn, &h).await?;
-                Ok::<_, Fail>((cand, s, r, w))
-            };
-            tokio::pin!(fut);
-            loop {
-                tokio::select! {
-                    r = &mut fut => break Some(r),
-                    ev = ev_rx.recv() => if !offline_event(ev, sh, hello, pending) { break None },
+        let fut = async {
+            let cand = net::race(rs, None, Duration::from_millis(300)).await.map_err(Fail::Retry)?;
+            let (s, r, w) = handshake(&cand.conn, &h).await?;
+            Ok::<_, Fail>((cand, s, r, w))
+        };
+        tokio::pin!(fut);
+        let sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(sleep);
+        let mut waiting = false;
+        let res = loop {
+            tokio::select! {
+                r = &mut fut, if !waiting => {
+                    match r {
+                        Err(Fail::Retry(_)) => {
+                            // Wait a little, then try again.
+                            waiting = true;
+                            sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis((250 * attempt as u64).min(2000)));
+                        }
+                        r => break Some(r),
+                    }
+                }
+                _ = &mut sleep, if waiting => break None,
+                ev = ev_rx.recv() => if !offline_event(ev, sh, hello) { return Ok(None) },
+                _ = badge_tick.tick() => {
+                    if Instant::now() >= quiet_until {
+                        ui.badge(Some(&reconnect_badge(start)));
+                    }
+                    ui.tick();
+                    ui.push(&sh.out);
                 }
             }
         };
         match res {
-            None => return Ok(None),
+            None => {}
             Some(Ok((cand, s, r, w))) => {
                 crate::paths::log(format!("reconnected via {:?} after {:?}, resume at {}", cand.kind, start.elapsed(), h.offset));
                 if fresh_token.is_some() {
                     hello.client_id = Some(w.client_id);
-                    hello.token = w.resume_token;
+                    hello.token = w.resume_token.clone();
                 }
+                let resend = resend_after(sh, &w);
                 let conn = link.adopt(cand);
+                let shown = ui.badge.is_some();
                 ui.badge(None);
-                ui.note(format!("qsh ✓ reconnected · {} · {:.1}s", link.path_name(), start.elapsed().as_secs_f32()), false, 3);
+                if shown {
+                    ui.note(format!("qsh ✓ reconnected · {} · {:.1}s", link.path_name(), start.elapsed().as_secs_f32()), false, 3);
+                }
                 ui.push(&sh.out);
-                return Ok(Some((conn, s, r)));
+                return Ok(Some((conn, s, r, resend)));
             }
             Some(Err(Fail::Fatal(e))) => {
                 ui.badge(None);
                 return Err(e);
             }
             Some(Err(Fail::Unknown)) => {
-                // The server forgot us: get a new token over SSH and attach again.
+                // The server forgot us: get a new token over SSH and attach
+                // again, as a new client. Unacknowledged keys go again.
                 let Some(spec) = link.spec.clone() else { bail!("the server forgot this client") };
                 if let Ok(hp) = net::spawn_helper(&spec, false, true, true).await {
                     fresh_token = hp.line.token.clone();
+                    let mut log = sh.input.lock().unwrap();
+                    let keys = log.since(0);
+                    log.reset();
+                    log.push(&keys);
+                    let _ = sh.out.try_send(Out::NewClient);
                 }
-                continue;
             }
             Some(Err(Fail::Retry(_))) => {}
         }
-        let sleep = tokio::time::sleep(Duration::from_millis((250 * attempt as u64).min(2000)));
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                _ = &mut sleep => break,
-                ev = ev_rx.recv() => if !offline_event(ev, sh, hello, pending) { return Ok(None) },
-            }
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputLog;
+
+    #[test]
+    fn input_log() {
+        let mut l = InputLog::default();
+        assert_eq!(l.push(b"abc"), 3);
+        assert_eq!(l.push(b"de"), 5);
+        assert_eq!(l.since(0), b"abcde");
+        assert_eq!(l.since(3), b"de");
+        l.ack(2);
+        assert_eq!(l.since(0), b"cde");
+        assert_eq!(l.since(5), b"");
+        assert_eq!(l.since(9), b"");
     }
 }

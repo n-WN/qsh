@@ -5,14 +5,16 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 
 | Need | qsh |
 |---|---|
-| Network changes (Wi-Fi to LTE, sleep, new IP) | QUIC connection migration, plus lossless resume on a new connection |
+| Network changes (Wi-Fi to LTE, sleep, new IP) | QUIC connection migration, plus lossless resume on a new connection. No key is lost or sent twice |
+| Slow or broken link | Typed characters show at once (local echo prediction), also while the link is down. Never at a password prompt |
 | UDP blocked | QUIC over UDP and QUIC through the SSH channel race; no timeout to wait for. qsh moves back to UDP when UDP works again |
 | Full modern VT | Raw byte stream to your own terminal: truecolor, OSC 8, kitty keyboard, synchronized output, your `TERM` (terminfo is compiled on the server if it is missing) |
 | Scrollback | Native scrollback, selection and scrolling of your terminal. On reattach, the history comes back with all attributes, links and soft wraps |
 | Kitty graphics protocol | Works (`kitten icat`, yazi, timg). The pixel size of the window is forwarded |
 | Clipboard | Both directions, any data type. `xclip`, `xsel`, `wl-copy`, `wl-paste`, `pbcopy`, `pbpaste` on the server use your local clipboard. The commands that Claude Code runs on Ctrl-V return the local image |
 | Files without scp | Drop files into the terminal: they go to the server and the remote paths are pasted. `qsh send` / `qsh get` in the session, `qsh cp` on your machine, all on the open connection |
-| Multiplexer | Sessions live on the server. Detach, reattach from another device, many sessions per client, live sharing |
+| Multiplexer | Sessions live on the server. Detach, reattach from another device, many sessions per client, live sharing. Clients with different window sizes: the one that types sets the size, the others show a view |
+| Install and upgrade | The client installs itself on the server. A new version takes over the running daemon: sessions and clients stay |
 
 ## How it works
 
@@ -25,8 +27,10 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 ```
 
 1. `qsh host` runs `ssh host qsh helper`. The helper starts the per-user daemon if
-   necessary and prints the UDP port, the SHA-256 of the daemon certificate and a
-   one-time token. SSH does the authentication, as with mosh.
+   necessary and prints the UDP port, the SHA-256 of the daemon certificate, a
+   one-time token, and its build. SSH does the authentication, as with mosh. If
+   the server has no qsh, or an older one, the client installs its own build
+   first (see [Install and upgrades](#install-and-upgrades)).
 2. The client connects with QUIC and pins the certificate. QUIC over UDP and
    QUIC through the same SSH process (a datagram pipe) start at the same time.
    The first that works wins; UDP gets 150 ms more when the tunnel is first.
@@ -77,6 +81,44 @@ character, it does not end a synchronized update of the program, and it
 handles insert mode and the line-drawing character set. Help, the session list
 and connection information use the same overlay.
 
+### Local echo
+
+At a long round trip (30 ms or more) or when the link stalls, typed characters
+show at once at the cursor, before the server's echo. The server acknowledges
+input when the program has had it for 50 ms, after the output that holds the
+echo; then every predicted cell must be on the screen. If one is not, all
+predictions go away, and the screen shows only what the server sent.
+Predictions that wait long are underlined.
+
+Predictions show only where an echo is sure:
+
+- the kernel echoes (line mode with echo), or a shell's line editor reads the
+  line (the server reports the pty mode and the foreground program)
+- in other programs (vim, a REPL), only after a prediction of the typing burst
+  came true
+- never when the terminal does not echo in line mode (a password prompt), and
+  never while the cursor is hidden (the program draws its own cursor)
+
+Characters, Backspace (not left of where typing started), wide characters,
+insertion inside a line and the kitty keyboard protocol are predicted. After
+Enter and other keys with an unknown effect, prediction waits until the server
+has had the key. `--predict auto|always|never` (default `auto`).
+
+All input goes into a log until the server acknowledges it. On a new
+connection the server tells how much input it has; the client sends the rest.
+Keys typed while the link is down show as predictions and arrive exactly once.
+
+### Several clients
+
+The client that types (or attached) last sets the pty size; its output goes to
+its terminal as it is. Another client with a different window size cannot
+show that output directly. It shows a view instead: its terminal switches to
+the alternate screen, and the client draws its own mirror of the screen there
+(only rows that changed). A larger window shows the pty area and a dotted
+fill; a smaller one shows the part with the cursor. Type in a window to make it
+set the size again: its main screen comes back, and the lines that scrolled
+during the view go into its scrollback.
+
 ### Flow control
 
 The server keeps unacknowledged output per connection to about two congestion
@@ -89,21 +131,44 @@ behind gets a snapshot.
 
 ## Install
 
-Build on both machines (Rust 1.88 or later):
+Build on your machine (Rust 1.88 or later):
 
 ```sh
 cargo build --release
 install -m 755 target/release/qsh /usr/local/bin/   # or ~/.local/bin
 ```
 
-To build and install on a Linux server from this tree:
+The server needs nothing: the client installs qsh there.
+
+### Install and upgrades
+
+Each build has an id (a hash of its source) and a time (the newest source
+file). The client compares its build with the server's:
+
+- No qsh on the server, or an older build: the client puts its own build into
+  `~/.qsh/versions/<id>/` on the server and points `~/.qsh/current` to it. The
+  binary comes from the local cache (`~/.qsh/cache`), or is this program (same
+  platform), or is built on the server from the source inside the client (the
+  server needs a Rust toolchain; the first build takes a few minutes). A build
+  made on a server goes into the local cache, for other servers.
+- A newer build on the server stays. `--no-install` turns this off.
+
+When the helper of a newer build finds an older daemon, the daemon replaces
+its program in place (exec, same process): the ptys, the UDP socket, the local
+socket, the output rings, the screens and the clients go to the new program.
+The clients see their connection close and connect again at once (about
+0.1 s); no output is lost or shown twice, and no session ends.
+
+To build and install on a server from this tree (a server without network
+access to crates.io needs the dependencies in its cargo cache):
 
 ```sh
 scripts/deploy.sh user@host -i ~/.ssh/key
 ```
 
-On the server, the client looks for `qsh` in `PATH`, `~/.local/bin`,
-`~/.cargo/bin` and `~/.qsh/bin`. Use `--server PATH` for another place.
+On the server, the client runs `~/.qsh/current`, or else `qsh` from `PATH`,
+`~/.local/bin`, `~/.cargo/bin` or `~/.qsh/bin`. Use `--server PATH` for another
+place (then nothing is installed).
 
 ## Use
 
@@ -123,6 +188,8 @@ qsh --download-dir ~/inbox host   # where `qsh send` puts files (default: ~/Down
 Options that limit what the server can do on your machine: `--no-clipboard`,
 `--no-receive`, `--no-open`, `--no-osc52`, `--read-paths ask|always|never`
 (see [Security](#security)). `--no-drop` pastes dropped files as local paths.
+`--predict auto|always|never` controls [local echo](#local-echo);
+`--no-install` keeps the server's qsh as it is.
 
 Keys (the prefix is `Ctrl-^`, as in mosh):
 
@@ -239,20 +306,23 @@ another). It does not log in again. It was faster than scp in a test
 - Snapshots do not contain the scroll region (DECSTBM) or origin mode;
   full-screen programs set them again when they redraw. The overlay waits
   while origin mode is on.
-- With two clients on one session, the pty size follows the client that
-  attached or typed last. A client with a different window size sees that
-  layout. Terminal replies from the other client are dropped (heuristic).
+- A view (a client that does not set the pty size) does not show kitty
+  graphics, and mouse positions are not moved when the view shows a part of
+  a larger pty. Terminal replies from that client are dropped (heuristic).
 - The file picker and the consent dialog use AppleScript (macOS). On Linux
   clients, give paths and use `--read-paths always`.
 - Reconnects through the SSH tunnel use `BatchMode`: they need key or agent
   authentication.
-- A new server binary does not replace a running daemon. The old daemon stops
-  when it has no sessions for 5 minutes.
+- Prediction works on the cursor row only. Programs that draw their own
+  cursor get no prediction.
+- A build on the server needs a Rust toolchain and the crates (crates.io, or
+  the cargo cache). Daemons from before the in-place upgrade cannot hand over
+  their sessions; they stop when they have no sessions for 5 minutes.
 
 ## Tests
 
 ```sh
-cargo test                     # mirror and snapshots, overlay repaint, ring buffer, archive, VT scanner, kitty keys, drop detection
+cargo test                     # mirror and snapshots, overlay, view mode, prediction, input log, ring buffer, archive, VT scanner, kitty keys, drop detection, build order
 tests/e2e/kitty_graphics.py target/release/qsh host local.png remote.png --port P
 ```
 
@@ -282,24 +352,41 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
 - A read-write share link: the guest can type, but `Ctrl-^ c` makes no session.
 - Session switch while vim runs: the new session starts clean, and `Ctrl-^ p`
   shows vim again.
+- Local echo: 30 ms after typing, the text is on the screen (with
+  `--predict never`, only after the round trip).
+- Typing during 8 s of dropped UDP: the text showed at once; after the move to
+  the SSH tunnel, the command ran exactly once. At a `read -s` prompt nothing
+  showed, and the password arrived exactly once.
+- Two clients (100×20 and 70×12) on one session: the larger one showed a view
+  of the 70×12 pty; after typing in it, it set the size, and the other showed
+  a view.
+- Daemon upgrade while a counter printed 10 lines per second: all 500 lines,
+  in order, once; the client was back after 0.12 s, with no badge.
+- A server without qsh: installed from the local cache in 2.5 s, prompt after
+  7 s. A server with an older qsh and no binary for its platform here: built
+  on the server, then the running daemon took over the new build.
 
 ## Source layout
 
 | File | Content |
 |---|---|
 | `src/main.rs` | command line, shim dispatch by program name |
+| `build.rs`, `src/version.rs` | build id and time, the source inside the binary |
 | `src/proto.rs` | frames and messages |
 | `src/tls.rs` | certificate, fingerprint pinning, QUIC transport settings |
 | `src/files.rs` | streaming archive for file transfer |
 | `src/tools.rs` | tools inside a session, and the clipboard shims |
-| `src/server/daemon.rs` | QUIC listener, attach and resume, flow control, local socket |
+| `src/server/daemon.rs` | QUIC listener, attach and resume, flow control, input acknowledgements, sizes, local socket, in-place upgrade |
 | `src/vt.rs` | mirror of the screen (alacritty_terminal) and its serializer |
-| `src/server/session.rs` | pty session, ring buffer, backpressure |
+| `src/server/session.rs` | pty session, ring buffer, backpressure, pty mode |
 | `src/server/helper.rs` | `qsh helper` (SSH bootstrap and datagram relay) |
 | `src/server/pty.rs` | pty and child process |
-| `src/client/mod.rs` | connect, liveness, reconnect, session switch, overlay state |
+| `src/client/mod.rs` | connect, liveness, reconnect, input log, session switch, overlay state |
 | `src/client/net.rs` | SSH helper process, SSH tunnel socket, path race, path changes |
-| `src/client/term.rs` | raw mode, keys, paste, output thread with overlay, VT scanner |
+| `src/client/install.rs` | install and upgrade qsh on the server |
+| `src/client/term.rs` | raw mode, keys, paste |
+| `src/client/screen.rs` | output thread: overlay, predictions, view mode, VT scanner |
+| `src/client/predict.rs` | local echo prediction |
 | `src/client/drop.rs` | drag and drop: path detection, upload, paste rewrite |
 | `src/client/rpc.rs` | requests from the server, `qsh cp` |
 | `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |

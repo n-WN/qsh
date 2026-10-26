@@ -1,9 +1,10 @@
 //! The per-user daemon: one UDP port (QUIC), many sessions, many clients.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -25,7 +26,16 @@ use crate::{
     files, paths,
     proto::{self, Control, Hello, LocalReply, LocalReq, Reply, Rpc, SessionInfo, Welcome, kind},
     tls,
+    version::Build,
+    vt::Prep,
 };
+
+/// Time that a program has to echo input before the input is acknowledged.
+const ECHO_WAIT: Duration = Duration::from_millis(50);
+/// QUIC close code: the daemon restarts with a new program; connect again now.
+pub const CLOSE_UPGRADE: u32 = 2;
+/// Format of the state that a daemon gives to its successor.
+pub const STATE_VERSION: u32 = 1;
 
 /// A client further behind than this gets a screen snapshot instead of the backlog.
 const LAG_LIMIT: u64 = 4 << 20;
@@ -33,6 +43,7 @@ const CHUNK: usize = 64 * 1024;
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(120);
 const STALE_CLIENT: Duration = Duration::from_secs(7 * 24 * 3600);
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 enum Grant {
     Bootstrap,
     Share { session: String, readonly: bool },
@@ -46,6 +57,12 @@ struct GrantEntry {
 pub struct Daemon {
     port: u16,
     fp: String,
+    /// Sockets and the lock that a new daemon program takes over.
+    udp_fd: RawFd,
+    unix_fd: RawFd,
+    lock_fd: RawFd,
+    /// An upgrade is in progress: new connections wait for the new program.
+    upgrading: AtomicBool,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     grants: Mutex<HashMap<String, GrantEntry>>,
     next_id: AtomicU64,
@@ -55,8 +72,8 @@ pub struct Daemon {
 
 enum Start {
     Offset(u64),
-    /// history: send the scrollback; clean: the client screen is blank.
-    Snapshot { history: bool, clean: bool },
+    /// history: lines of scrollback to send (see Mirror::snapshot).
+    Snapshot { history: Option<usize>, prep: Prep },
 }
 
 /// State of one QUIC connection.
@@ -78,14 +95,40 @@ struct Attached {
     welcome: Welcome,
 }
 
-pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
+pub async fn run(port: Option<u16>, idle_exit: Duration, resume: Option<PathBuf>) -> Result<()> {
     let run_dir = paths::run_dir()?;
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(run_dir.join("daemon.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another qsh daemon is running");
-    }
     let id = tls::load_or_create(&paths::base())?;
-    let (sock, port) = bind_udp(port)?;
+    let saved = match &resume {
+        Some(p) => Some(load_state(p)?),
+        None => None,
+    };
+    let (lock_fd, sock, port, listener) = match &saved {
+        Some((st, _)) => {
+            // Taken over from the previous daemon program (same process).
+            let sock = unsafe { std::net::UdpSocket::from_raw_fd(st.udp_fd) };
+            let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(st.unix_fd) };
+            l.set_nonblocking(true)?;
+            for fd in [st.lock_fd, st.udp_fd, st.unix_fd] {
+                set_cloexec(fd);
+            }
+            (st.lock_fd, sock, st.port, UnixListener::from_std(l)?)
+        }
+        None => {
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(run_dir.join("daemon.lock"))?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                bail!("another qsh daemon is running");
+            }
+            let (sock, port) = bind_udp(port)?;
+            let sock_path = paths::daemon_sock()?;
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).context("bind daemon socket")?;
+            // The lock lives as long as the process (and its successors).
+            let fd = std::os::fd::IntoRawFd::into_raw_fd(lock);
+            (fd, sock, port, listener)
+        }
+    };
+    let udp_fd = sock.as_raw_fd();
+    let unix_fd = listener.as_raw_fd();
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(tls::server_config(&id)?),
@@ -93,26 +136,36 @@ pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
         Arc::new(quinn::TokioRuntime),
     )?;
     let sock_path = paths::daemon_sock()?;
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path).context("bind daemon socket")?;
     if let Err(e) = install_shims() {
         eprintln!("qsh daemon: cannot install shims: {e:#}");
     }
     paths::write_private(
         &run_dir.join("daemon.json"),
-        serde_json::json!({"port": port, "fp": id.fp, "pid": std::process::id()}).to_string().as_bytes(),
+        serde_json::json!({"port": port, "fp": id.fp, "pid": std::process::id(), "build": Build::current().to_string()})
+            .to_string()
+            .as_bytes(),
     )?;
-    eprintln!("qsh daemon: pid {} udp port {port} fp {}", std::process::id(), id.fp);
 
     let d = Arc::new(Daemon {
         port,
         fp: id.fp.clone(),
+        udp_fd,
+        unix_fd,
+        lock_fd,
+        upgrading: AtomicBool::new(false),
         sessions: Mutex::new(HashMap::new()),
         grants: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         conns: AtomicUsize::new(0),
         last_active: Mutex::new(Instant::now()),
     });
+    match saved {
+        Some((st, blobs)) => {
+            let n = d.restore(st, &blobs);
+            eprintln!("qsh daemon: pid {} build {} took over {n} session(s)", std::process::id(), crate::version::describe());
+        }
+        None => eprintln!("qsh daemon: pid {} build {} udp port {port} fp {}", std::process::id(), crate::version::describe(), id.fp),
+    }
 
     let dl = d.clone();
     tokio::spawn(async move {
@@ -133,7 +186,7 @@ pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
     let sp = sock_path.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             di.sweep();
             let idle = di.sessions.lock().unwrap().is_empty()
                 && di.conns.load(Ordering::SeqCst) == 0
@@ -147,6 +200,12 @@ pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
     });
 
     while let Some(inc) = endpoint.accept().await {
+        if d.upgrading.load(Ordering::SeqCst) {
+            // No answer: the client sends its first packet again, and the
+            // new program (same UDP socket) answers it.
+            inc.ignore();
+            continue;
+        }
         let d = d.clone();
         tokio::spawn(async move {
             if let Err(e) = d.clone().handle_conn(inc).await {
@@ -155,6 +214,13 @@ pub async fn run(port: Option<u16>, idle_exit: Duration) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn set_cloexec(fd: RawFd) {
+    unsafe {
+        let f = libc::fcntl(fd, libc::F_GETFD);
+        libc::fcntl(fd, libc::F_SETFD, f | libc::FD_CLOEXEC);
+    }
 }
 
 fn bind_udp(pref: Option<u16>) -> Result<(std::net::UdpSocket, u16)> {
@@ -237,6 +303,13 @@ impl Daemon {
                 .collect();
             for id in stale {
                 s.remove_client(&mut st, id);
+            }
+            // The client that set the size is gone: a connected client takes over.
+            let gone = st.active.and_then(|a| st.clients.get(&a)).is_some_and(|c| c.gone_since.is_some_and(|t| t.elapsed() > Duration::from_secs(3)));
+            if gone
+                && let Some(next) = st.clients.iter().filter(|(_, c)| c.conn.is_some() && !c.readonly).map(|(k, _)| *k).max()
+            {
+                s.activate(&mut st, next);
             }
         }
     }
@@ -416,6 +489,8 @@ impl Daemon {
             slot.gone_since = None;
             slot.acked = h.offset;
             slot.ack_at = Instant::now();
+            slot.echo = None;
+            let input_seen = slot.input_seen;
             if !h.server_addr.is_empty() {
                 slot.server_addr = h.server_addr.clone();
             }
@@ -432,7 +507,16 @@ impl Daemon {
                 epoch,
                 owner,
                 start: Start::Offset(h.offset),
-                welcome: Welcome { ok: true, client_id: id, resume_token: token, session: name, resumed: true, readonly, ..Default::default() },
+                welcome: Welcome {
+                    ok: true,
+                    client_id: id,
+                    resume_token: token,
+                    session: name,
+                    resumed: true,
+                    readonly,
+                    input_seen: Some(input_seen),
+                    ..Default::default()
+                },
             });
         }
 
@@ -481,22 +565,7 @@ impl Daemon {
             }
         };
         if created {
-            let d = self.clone();
-            let s = sess.clone();
-            tokio::spawn(async move {
-                let mut rx = s.exit.subscribe();
-                while rx.borrow_and_update().is_none() {
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let mut ss = d.sessions.lock().unwrap();
-                if ss.get(&s.name).is_some_and(|x| Arc::ptr_eq(x, &s)) {
-                    ss.remove(&s.name);
-                }
-                *d.last_active.lock().unwrap() = Instant::now();
-            });
+            self.watch_exit(sess.clone());
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let token = paths::random_hex(32);
@@ -516,6 +585,8 @@ impl Daemon {
                 server_addr: h.server_addr.clone(),
                 acked,
                 ack_at: Instant::now(),
+                input_seen: 0,
+                echo: None,
             },
         );
         let before = st.size;
@@ -534,9 +605,41 @@ impl Daemon {
             id,
             epoch: 1,
             owner,
-            start: if created { Start::Offset(0) } else { Start::Snapshot { history: true, clean: h.clean } },
-            welcome: Welcome { ok: true, client_id: id, resume_token: token, session: name, created, readonly, ..Default::default() },
+            start: if created {
+                Start::Offset(0)
+            } else {
+                Start::Snapshot { history: Some(usize::MAX), prep: if h.clean { Prep::Blank } else { Prep::Scroll } }
+            },
+            welcome: Welcome {
+                ok: true,
+                client_id: id,
+                resume_token: token,
+                session: name,
+                created,
+                readonly,
+                input_seen: Some(0),
+                ..Default::default()
+            },
         })
+    }
+
+    /// Forget a session 2 s after its program ends (clients get the exit code first).
+    fn watch_exit(self: &Arc<Self>, s: Arc<Session>) {
+        let d = self.clone();
+        tokio::spawn(async move {
+            let mut rx = s.exit.subscribe();
+            while rx.borrow_and_update().is_none() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut ss = d.sessions.lock().unwrap();
+            if ss.get(&s.name).is_some_and(|x| Arc::ptr_eq(x, &s)) {
+                ss.remove(&s.name);
+            }
+            *d.last_active.lock().unwrap() = Instant::now();
+        });
     }
 
     fn create_session(&self, name: &str, h: &Hello) -> Result<Arc<Session>> {
@@ -571,16 +674,30 @@ impl Daemon {
             LocalReq::Token => {
                 let token = paths::random_hex(32);
                 self.grants.lock().unwrap().insert(token.clone(), GrantEntry { grant: Grant::Bootstrap, expires: Instant::now() + BOOTSTRAP_TTL });
-                let rep = LocalReply { ok: true, port: self.port, fp: self.fp.clone(), token, ..Default::default() };
+                let rep = LocalReply { ok: true, port: self.port, fp: self.fp.clone(), token, build: Build::current().to_string(), ..Default::default() };
                 proto::write_msg(&mut w, &rep).await?;
             }
             LocalReq::Info => {
-                let rep = LocalReply { ok: true, port: self.port, fp: self.fp.clone(), ..Default::default() };
+                let rep = LocalReply { ok: true, port: self.port, fp: self.fp.clone(), build: Build::current().to_string(), ..Default::default() };
                 proto::write_msg(&mut w, &rep).await?;
             }
             LocalReq::List => {
-                let rep = LocalReply { ok: true, sessions: self.list(), port: self.port, fp: self.fp.clone(), ..Default::default() };
+                let rep = LocalReply {
+                    ok: true,
+                    sessions: self.list(),
+                    port: self.port,
+                    fp: self.fp.clone(),
+                    build: Build::current().to_string(),
+                    ..Default::default()
+                };
                 proto::write_msg(&mut w, &rep).await?;
+            }
+            LocalReq::Upgrade { exe } => {
+                // Replies only on failure: on success, this process runs the new program.
+                if let Err(e) = self.upgrade(&exe).await {
+                    eprintln!("qsh daemon: upgrade: {e:#}");
+                    proto::write_msg(&mut w, &LocalReply { ok: false, error: Some(format!("{e:#}")), ..Default::default() }).await?;
+                }
             }
             LocalReq::Rpc { session, rpc } => {
                 let conn = match self.target(&session) {
@@ -660,44 +777,96 @@ fn window(conn: &quinn::Connection) -> u64 {
     (2 * conn.stats().path.cwnd).clamp(256 << 10, 4 << 20)
 }
 
+fn size_frame(s: (u16, u16, bool)) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.extend_from_slice(&s.0.to_be_bytes());
+    p.extend_from_slice(&s.1.to_be_bytes());
+    p.push(if s.2 { proto::SIZE_MINE } else { 0 });
+    proto::frame(kind::SIZE, &p)
+}
+
+fn input_ack_frame(n: u64, mode: u8) -> Vec<u8> {
+    let mut p = n.to_be_bytes().to_vec();
+    p.push(mode);
+    proto::frame(kind::INPUT_ACK, &p)
+}
+
 async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch: u64, tx: mpsc::Sender<Vec<u8>>, start: Start) {
     let mut head_rx = sess.head.subscribe();
     let mut ack_rx = sess.ack.subscribe();
     let mut exit_rx = sess.exit.subscribe();
     let (mut off, mut snap) = match start {
         Start::Offset(o) => (o, None),
-        Start::Snapshot { history, clean } => (0, Some((history, clean))),
+        Start::Snapshot { history, prep } => (0, Some((history, prep))),
     };
+    // What this client knows: the pty size (and if it sets it), the pty mode,
+    // and the last input acknowledgement.
+    let mut sent_size: Option<(u16, u16, bool)> = None;
+    let mut sent_mode: Option<u8> = None;
+    let mut last_ack = 0u64;
     loop {
         head_rx.borrow_and_update();
         ack_rx.borrow_and_update();
         let win = window(&conn);
         let next = {
             let mut st = sess.st.lock().unwrap();
-            let acked = match st.clients.get(&id) {
-                Some(c) if c.epoch == epoch => c.acked,
+            let (acked, echo) = match st.clients.get(&id) {
+                Some(c) if c.epoch == epoch => (c.acked, c.echo),
                 _ => return,
             };
             let head = st.ring.head();
-            if let Some((history, clean)) = snap.take() {
-                let b = st.mirror.snapshot(history, clean);
+            let size = (st.size[0], st.size[1], st.active == Some(id));
+            let mut out = Vec::new();
+            let snapshot = match snap.take() {
+                Some(s) => Some(s),
+                None if off < st.ring.base() || off > head || head - off > LAG_LIMIT => Some((None, Prep::Scroll)),
+                None => None,
+            };
+            if let Some((history, prep)) = snapshot {
+                out.extend(size_frame(size));
+                sent_size = Some(size);
+                let b = st.mirror.snapshot(history, prep);
                 off = head;
-                Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
-            } else if off < st.ring.base() || off > head || head - off > LAG_LIMIT {
-                let b = st.mirror.snapshot(false, false);
-                off = head;
-                Next::Frame(proto::frame_at(kind::SNAPSHOT, head, &b))
-            } else if off < head {
-                let inflight = off.saturating_sub(acked);
-                if inflight >= win {
-                    Next::Wait
-                } else {
-                    let n = (CHUNK as u64).min(win - inflight) as usize;
-                    let d = st.ring.read(off, n).unwrap_or_default();
-                    let f = proto::frame_at(kind::OUTPUT, off, &d);
-                    off += d.len() as u64;
-                    Next::Frame(f)
+                out.extend(proto::frame_at(kind::SNAPSHOT, head, &b));
+            } else {
+                // A new size goes out at its place in the stream; a change of
+                // who sets it goes out at once.
+                let only_owner = sent_size.is_some_and(|s| (s.0, s.1) == (size.0, size.1));
+                if sent_size != Some(size) && (off >= st.size_at || only_owner) {
+                    out.extend(size_frame(size));
+                    sent_size = Some(size);
                 }
+                let inflight = off.saturating_sub(acked);
+                if off < head && inflight < win {
+                    let mut n = (CHUNK as u64).min(win - inflight);
+                    if sent_size != Some(size) && off < st.size_at {
+                        n = n.min(st.size_at - off);
+                    }
+                    let d = st.ring.read(off, n as usize).unwrap_or_default();
+                    out.extend(proto::frame_at(kind::OUTPUT, off, &d));
+                    off += d.len() as u64;
+                    if sent_size != Some(size) && off >= st.size_at {
+                        out.extend(size_frame(size));
+                        sent_size = Some(size);
+                    }
+                }
+            }
+            // The input acknowledgement follows the output that holds the echo.
+            if let Some((n, h)) = echo
+                && off >= h
+            {
+                out.extend(input_ack_frame(n, st.mode));
+                last_ack = n;
+                sent_mode = Some(st.mode);
+                if let Some(c) = st.clients.get_mut(&id) {
+                    c.echo = None;
+                }
+            } else if st.mode != 0 && sent_mode != Some(st.mode) {
+                out.extend(input_ack_frame(last_ack, st.mode));
+                sent_mode = Some(st.mode);
+            }
+            if !out.is_empty() {
+                Next::Frame(out)
             } else if let Some(code) = *exit_rx.borrow_and_update() {
                 Next::Exit(code)
             } else {
@@ -732,13 +901,15 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
     while let Some((k, p)) = proto::read_frame(recv).await? {
         match k {
             kind::INPUT => {
-                let ok = {
+                let (ok, count) = {
                     let mut st = sess.st.lock().unwrap();
-                    let Some(slot) = st.clients.get(&id) else { return Ok(()) };
+                    let Some(slot) = st.clients.get_mut(&id) else { return Ok(()) };
                     if slot.epoch != epoch {
                         return Ok(());
                     }
-                    if slot.readonly {
+                    slot.input_seen += p.len() as u64;
+                    let count = slot.input_seen;
+                    let ok = if slot.readonly {
                         false
                     } else if st.active != Some(id) {
                         if session::looks_like_report(&p) {
@@ -749,11 +920,28 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
                         }
                     } else {
                         true
-                    }
+                    };
+                    (ok, count)
                 };
                 if ok {
                     sess.write_input(p);
                 }
+                // Acknowledge the input when the program had time to echo it.
+                let s = sess.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ECHO_WAIT).await;
+                    s.update_mode();
+                    {
+                        let mut st = s.st.lock().unwrap();
+                        let head = st.ring.head();
+                        if let Some(c) = st.clients.get_mut(&id)
+                            && c.echo.is_none_or(|(n, _)| n < count)
+                        {
+                            c.echo = Some((count, head));
+                        }
+                    }
+                    s.ack.send_modify(|x| *x = x.wrapping_add(1));
+                });
             }
             kind::RESIZE if p.len() >= 4 => {
                 let v = |i: usize| if p.len() >= i + 2 { u16::from_be_bytes([p[i], p[i + 1]]) } else { 0 };
@@ -796,6 +984,254 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
         }
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    version: u32,
+    port: u16,
+    udp_fd: RawFd,
+    unix_fd: RawFd,
+    lock_fd: RawFd,
+    next_id: u64,
+    /// (token, grant, milliseconds left)
+    grants: Vec<(String, Grant, u64)>,
+    sessions: Vec<SavedSession>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedSession {
+    name: String,
+    command: String,
+    pid: i32,
+    created: u64,
+    master_fd: RawFd,
+    size: [u16; 4],
+    active: Option<u64>,
+    clients: Vec<SavedClient>,
+    ring_base: u64,
+    /// Blob lengths: the ring, then a snapshot of the mirror.
+    ring_len: usize,
+    snap_len: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedClient {
+    id: u64,
+    size: [u16; 4],
+    readonly: bool,
+    owner: bool,
+    resume_token: String,
+    server_addr: String,
+    acked: u64,
+    input_seen: u64,
+}
+
+/// File layout: u64 length of the JSON header, the header, then the blobs.
+fn load_state(p: &Path) -> Result<(SavedState, Vec<u8>)> {
+    let data = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+    let _ = std::fs::remove_file(p);
+    if data.len() < 8 {
+        bail!("short state file");
+    }
+    let n = u64::from_be_bytes(data[..8].try_into().unwrap()) as usize;
+    let st: SavedState = serde_json::from_slice(data.get(8..8 + n).ok_or_else(|| anyhow!("short state file"))?)?;
+    if st.version != STATE_VERSION {
+        bail!("state version {} is not {STATE_VERSION}", st.version);
+    }
+    Ok((st, data[8 + n..].to_vec()))
+}
+
+fn dup_fd(fd: RawFd, keep: &mut Vec<RawFd>) -> Result<RawFd> {
+    // dup() gives a descriptor without close-on-exec: it survives exec.
+    let n = unsafe { libc::dup(fd) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    keep.push(n);
+    Ok(n)
+}
+
+impl Daemon {
+    /// Replace this process with the program `exe` (same pid): the pty
+    /// masters, the UDP socket, the local socket and the lock stay open, and
+    /// the new program gets the sessions, rings, screens and clients. Clients
+    /// see their connection close and connect again at once.
+    async fn upgrade(self: &Arc<Self>, exe: &str) -> Result<()> {
+        let exe = PathBuf::from(exe);
+        let check = tokio::process::Command::new(&exe)
+            .args(["daemon", "--check-upgrade", &STATE_VERSION.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let ok = tokio::time::timeout(Duration::from_secs(5), check).await.ok().and_then(|r| r.ok()).is_some_and(|s| s.success());
+        if !ok {
+            bail!("{} cannot take over this daemon", exe.display());
+        }
+        self.upgrading.store(true, Ordering::SeqCst);
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let ss = sessions.clone();
+        let quiet = tokio::task::spawn_blocking(move || ss.iter().all(|s| s.quiesce(Duration::from_secs(1)))).await?;
+        let resume = || {
+            sessions.iter().for_each(|s| s.resume_reading());
+            self.upgrading.store(false, Ordering::SeqCst);
+        };
+        if !quiet {
+            resume();
+            bail!("the sessions did not stop");
+        }
+        // No more input: close the client connections first.
+        for s in &sessions {
+            for c in s.st.lock().unwrap().clients.values() {
+                if let Some(conn) = &c.conn {
+                    conn.close(CLOSE_UPGRADE.into(), b"upgrade");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ss = sessions.clone();
+        tokio::task::spawn_blocking(move || ss.iter().all(|s| s.quiesce(Duration::from_millis(500)))).await?;
+
+        let mut fds = Vec::new();
+        let r = self.exec_with_state(&exe, &sessions, &mut fds);
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+        resume();
+        r
+    }
+
+    fn exec_with_state(&self, exe: &Path, sessions: &[Arc<Session>], fds: &mut Vec<RawFd>) -> Result<()> {
+        let mut blobs = Vec::new();
+        let mut saved = Vec::new();
+        for s in sessions {
+            let mut st = s.st.lock().unwrap();
+            let ring = st.ring.contents();
+            let snap = st.mirror.snapshot(Some(usize::MAX), Prep::Blank);
+            saved.push(SavedSession {
+                name: s.name.clone(),
+                command: s.command.clone(),
+                pid: s.pid,
+                created: s.created,
+                master_fd: dup_fd(s.master_fd().as_raw_fd(), fds)?,
+                size: st.size,
+                active: st.active,
+                clients: st
+                    .clients
+                    .iter()
+                    .map(|(id, c)| SavedClient {
+                        id: *id,
+                        size: c.size,
+                        readonly: c.readonly,
+                        owner: c.owner,
+                        resume_token: c.resume_token.clone(),
+                        server_addr: c.server_addr.clone(),
+                        acked: c.acked,
+                        input_seen: c.input_seen,
+                    })
+                    .collect(),
+                ring_base: st.ring.base(),
+                ring_len: ring.len(),
+                snap_len: snap.len(),
+            });
+            blobs.extend_from_slice(&ring);
+            blobs.extend_from_slice(&snap);
+        }
+        let now = Instant::now();
+        let grants = self
+            .grants
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, g)| g.expires > now)
+            .map(|(k, g)| (k.clone(), g.grant.clone(), (g.expires - now).as_millis() as u64))
+            .collect();
+        let state = SavedState {
+            version: STATE_VERSION,
+            port: self.port,
+            udp_fd: dup_fd(self.udp_fd, fds)?,
+            unix_fd: dup_fd(self.unix_fd, fds)?,
+            lock_fd: dup_fd(self.lock_fd, fds)?,
+            next_id: self.next_id.load(Ordering::SeqCst),
+            grants,
+            sessions: saved,
+        };
+        let head = serde_json::to_vec(&state)?;
+        let mut file = (head.len() as u64).to_be_bytes().to_vec();
+        file.extend_from_slice(&head);
+        file.extend_from_slice(&blobs);
+        let path = paths::run_dir()?.join(format!("upgrade-{}.state", std::process::id()));
+        paths::write_private(&path, &file)?;
+        eprintln!("qsh daemon: upgrade to {}", exe.display());
+        let err = Command::new(exe).arg("daemon").arg("--resume-from").arg(&path).exec();
+        let _ = std::fs::remove_file(&path);
+        Err(anyhow!("exec {}: {err}", exe.display()))
+    }
+
+    /// Take over the sessions of the previous daemon program.
+    fn restore(self: &Arc<Self>, st: SavedState, blobs: &[u8]) -> usize {
+        self.next_id.store(st.next_id, Ordering::SeqCst);
+        let now = Instant::now();
+        {
+            let mut g = self.grants.lock().unwrap();
+            for (k, grant, ms) in st.grants {
+                g.insert(k, GrantEntry { grant, expires: now + Duration::from_millis(ms) });
+            }
+        }
+        let mut pos = 0;
+        let mut n = 0;
+        for ss in st.sessions {
+            let ring = &blobs[pos.min(blobs.len())..(pos + ss.ring_len).min(blobs.len())];
+            pos += ss.ring_len;
+            let snap = &blobs[pos.min(blobs.len())..(pos + ss.snap_len).min(blobs.len())];
+            pos += ss.snap_len;
+            set_cloexec(ss.master_fd);
+            let master = unsafe { OwnedFd::from_raw_fd(ss.master_fd) };
+            let mut mirror = crate::vt::Mirror::new(ss.size[0], ss.size[1], session::SCROLLBACK);
+            mirror.feed(snap);
+            let clients: BTreeMap<u64, ClientSlot> = ss
+                .clients
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        ClientSlot {
+                            size: c.size,
+                            readonly: c.readonly,
+                            owner: c.owner,
+                            resume_token: c.resume_token,
+                            conn: None,
+                            ctl: None,
+                            epoch: 1,
+                            gone_since: Some(now),
+                            server_addr: c.server_addr,
+                            acked: c.acked,
+                            ack_at: now,
+                            input_seen: c.input_seen,
+                            echo: None,
+                        },
+                    )
+                })
+                .collect();
+            let s = Session::launch(session::Parts {
+                name: ss.name.clone(),
+                command: ss.command,
+                pid: ss.pid,
+                created: ss.created,
+                master,
+                ring: session::Ring::restore(session::RING_CAP, ss.ring_base, ring),
+                mirror,
+                clients,
+                active: ss.active,
+                size: ss.size,
+            });
+            self.sessions.lock().unwrap().insert(ss.name, s.clone());
+            self.watch_exit(s);
+            n += 1;
+        }
+        n
+    }
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {

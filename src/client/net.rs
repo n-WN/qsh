@@ -35,8 +35,10 @@ impl SshSpec {
     pub fn remote_command(&self, args: &str) -> String {
         match &self.server_path {
             Some(p) => format!("{p} {args}"),
+            // ~/.qsh/current is the build that qsh clients install. Without
+            // qsh, report the platform, so that the client can install it.
             None => format!(
-                "sh -c 'Q=$(command -v qsh 2>/dev/null); for c in \"$HOME/.local/bin/qsh\" \"$HOME/.cargo/bin/qsh\" \"$HOME/.qsh/bin/qsh\"; do [ -n \"$Q\" ] && break; [ -x \"$c\" ] && Q=$c; done; [ -n \"$Q\" ] || {{ echo \"qsh: qsh is not installed on the server\" >&2; exit 127; }}; exec \"$Q\" {args}'"
+                "sh -c 'Q=; for c in \"$HOME/.qsh/current\" \"$(command -v qsh 2>/dev/null)\" \"$HOME/.local/bin/qsh\" \"$HOME/.cargo/bin/qsh\" \"$HOME/.qsh/bin/qsh\"; do [ -n \"$c\" ] && [ -x \"$c\" ] && {{ Q=$c; break; }}; done; [ -n \"$Q\" ] || {{ echo \"QSH-MISSING $(uname -s) $(uname -m)\"; exit 0; }}; exec \"$Q\" {args}'"
             ),
         }
     }
@@ -46,7 +48,22 @@ pub struct ConnectLine {
     pub port: u16,
     pub fp: String,
     pub token: Option<String>,
+    /// Build and platform of the server's qsh (None from old versions).
+    pub build: Option<crate::version::Build>,
+    pub platform: Option<String>,
 }
+
+/// The server has no qsh. The value is its platform ("linux-x86_64").
+#[derive(Debug)]
+pub struct Missing(pub String);
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "qsh is not installed on the server ({})", self.0)
+    }
+}
+
+impl std::error::Error for Missing {}
 
 /// A running `ssh host qsh helper` process.
 pub struct Helper {
@@ -112,7 +129,7 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
                 Ok(_) => {}
             }
             // Shell startup files can print text first; skip it.
-            if line.starts_with("QSH-CONNECT ") {
+            if line.starts_with("QSH-CONNECT ") || line.starts_with("QSH-MISSING ") {
                 let _ = line_tx.send(Ok(line.trim().to_string()));
                 break;
             }
@@ -166,6 +183,9 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
         .await?
         .map_err(|_| anyhow!("no answer from the qsh server over ssh"))??;
     let f: Vec<&str> = line.split_whitespace().collect();
+    if f[0] == "QSH-MISSING" && f.len() >= 3 {
+        return Err(Missing(crate::version::platform_of_uname(f[1], f[2])).into());
+    }
     if f.len() < 5 || f[1] != "1" {
         bail!("unexpected answer from the qsh server: {line}");
     }
@@ -173,6 +193,8 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
         port: f[2].parse().context("bad port")?,
         fp: f[3].to_string(),
         token: (f[4] != "-").then(|| f[4].to_string()),
+        build: f.get(5).and_then(|b| crate::version::Build::parse(b)),
+        platform: f.get(6).map(|p| p.to_string()),
     };
     Ok(Helper { child, line, to_ssh, from_ssh, alive })
 }

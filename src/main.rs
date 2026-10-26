@@ -7,6 +7,7 @@ mod proto;
 mod server;
 mod tls;
 mod tools;
+mod version;
 mod vt;
 
 use std::{path::PathBuf, time::Duration};
@@ -78,6 +79,13 @@ struct ConnectArgs {
     /// Paste dropped files as text paths (do not upload them).
     #[arg(long)]
     no_drop: bool,
+    /// Show typed characters before the server echoes them: when the round
+    /// trip is long (auto), always, or never.
+    #[arg(long, value_enum, default_value_t = PredictArg::Auto)]
+    predict: PredictArg,
+    /// Do not install or upgrade qsh on the server.
+    #[arg(long)]
+    no_install: bool,
     /// Tell which network path the connection uses.
     #[arg(short, long)]
     verbose: bool,
@@ -91,6 +99,13 @@ enum TransportArg {
     Auto,
     Udp,
     Ssh,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PredictArg {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -158,7 +173,16 @@ enum Cmd {
         /// Exit after this many seconds with no sessions and no clients.
         #[arg(long, default_value_t = 300)]
         idle_exit: u64,
+        /// Continue the sessions of the previous daemon program (upgrade).
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
+        /// Exit with success if this program can take over a daemon whose
+        /// state has this format version.
+        #[arg(long)]
+        check_upgrade: Option<u32>,
     },
+    /// Print the version and build of this program.
+    Version,
     #[command(hide = true)]
     Helper {
         #[arg(long)]
@@ -245,7 +269,14 @@ fn main() {
 fn real_main(cli: Cli) -> Result<i32> {
     let rt = runtime();
     match cli.cmd {
-        Some(Cmd::Daemon { port, idle_exit }) => rt.block_on(server::daemon::run(port, Duration::from_secs(idle_exit))).map(|_| 0),
+        Some(Cmd::Daemon { check_upgrade: Some(v), .. }) => Ok(if v == server::daemon::STATE_VERSION { 0 } else { 1 }),
+        Some(Cmd::Daemon { port, idle_exit, resume_from, .. }) => {
+            rt.block_on(server::daemon::run(port, Duration::from_secs(idle_exit), resume_from)).map(|_| 0)
+        }
+        Some(Cmd::Version) => {
+            println!("qsh {} build {} {}", version::describe(), version::Build::current(), version::platform());
+            Ok(0)
+        }
         Some(Cmd::Helper { port, tunnel, no_token, list }) => {
             rt.block_on(server::helper::run(server::helper::HelperArgs { port, tunnel, token: !no_token, list })).map(|_| 0)
         }
@@ -260,6 +291,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                 bail!("ssh failed: {}", String::from_utf8_lossy(&out.stderr).trim());
             }
             let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains("QSH-MISSING") {
+                bail!("qsh is not installed on {dest} (connect once to install it)");
+            }
             let line = text.lines().rev().find(|l| l.starts_with('[')).unwrap_or("[]");
             let sessions: Vec<proto::SessionInfo> = serde_json::from_str(line)?;
             tools::print_sessions(&sessions);
@@ -335,6 +369,12 @@ fn real_main(cli: Cli) -> Result<i32> {
                 policy,
                 osc52: !c.no_osc52,
                 verbose: c.verbose,
+                predict: match c.predict {
+                    PredictArg::Auto => client::Predict::Auto,
+                    PredictArg::Always => client::Predict::Always,
+                    PredictArg::Never => client::Predict::Never,
+                },
+                install: !c.no_install,
             };
             if dest.starts_with("qsh://") {
                 let (addr, fp, token, session) = parse_link(&dest)?;

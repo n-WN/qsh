@@ -70,6 +70,51 @@ pub fn spawn(argv: &[String], login: bool, env: &[(String, String)], cwd: &Path,
     Ok(Pty { master: r.master, child })
 }
 
+/// The pty mode as `proto::mode` bits: echo and line mode of the terminal,
+/// and whether the foreground program is a shell.
+pub fn mode(master: &OwnedFd) -> u8 {
+    use crate::proto::mode;
+    let mut m = 0;
+    if let Ok(t) = nix::sys::termios::tcgetattr(master) {
+        use nix::sys::termios::LocalFlags;
+        m |= mode::KNOWN;
+        if t.local_flags.contains(LocalFlags::ECHO) {
+            m |= mode::ECHO;
+        }
+        if t.local_flags.contains(LocalFlags::ICANON) {
+            m |= mode::ICANON;
+        }
+    }
+    let pgrp = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+    if pgrp > 0 && process_name(pgrp).is_some_and(|n| is_shell(&n)) {
+        m |= mode::SHELL;
+    }
+    m
+}
+
+fn is_shell(name: &str) -> bool {
+    let n = name.trim_start_matches('-');
+    ["bash", "zsh", "fish", "sh", "dash", "ash", "ksh", "mksh", "oksh", "yash", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh"].contains(&n)
+}
+
+fn process_name(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+        (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The current directory of a process, if it is known.
 pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "linux")]

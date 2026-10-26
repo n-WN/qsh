@@ -71,6 +71,44 @@ const RESET: &str = concat!(
     "\x1b[<99u\x1b[r",
 );
 
+/// How a snapshot starts on the client's screen.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Prep {
+    /// The screen is blank with the cursor at the top left.
+    Blank,
+    /// Scroll the old screen into the terminal's scrollback first.
+    Scroll,
+    /// Write over the old screen (it is not kept). Not with ED 2: some
+    /// terminals move the screen into the scrollback then.
+    Clear,
+}
+
+/// One cell, as the local echo prediction sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellView {
+    pub c: char,
+    /// The second half of a wide character.
+    pub spacer: bool,
+    pub wide: bool,
+    /// No colors, no attributes, a space.
+    pub blank: bool,
+    /// Foreground is the default color (not, for example, a dim suggestion).
+    pub plain_fg: bool,
+}
+
+/// What to draw in one column of a composed row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Src {
+    /// The cell of this row at that column (shifted text).
+    Orig(usize),
+    /// A typed character, in the pen at the cursor.
+    Char(char),
+    /// A space in the pen at the cursor.
+    Blank,
+    /// Second half of a wide character: nothing to draw.
+    Skip,
+}
+
 pub struct Mirror {
     term: Term<Title>,
     parser: Processor,
@@ -143,6 +181,116 @@ impl Mirror {
         }
     }
 
+    /// Lines of scrollback.
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// Cursor row and column, visible, and waiting to wrap.
+    pub fn cursor_info(&self) -> (usize, usize, bool, bool) {
+        let g = self.term.grid();
+        let p = g.cursor.point;
+        (p.line.0.max(0) as usize, p.column.0, self.term.mode().contains(TermMode::SHOW_CURSOR), g.cursor.input_needs_wrap)
+    }
+
+    /// The cells of a screen row.
+    pub fn row_view(&self, row: usize) -> Vec<CellView> {
+        let g = self.term.grid();
+        if row >= g.screen_lines() {
+            return Vec::new();
+        }
+        let r = &g[Line(row as i32)];
+        (0..g.columns())
+            .map(|c| {
+                let x = &r[Column(c)];
+                CellView {
+                    c: x.c,
+                    spacer: x.flags.contains(Flags::WIDE_CHAR_SPACER),
+                    wide: x.flags.contains(Flags::WIDE_CHAR),
+                    blank: blank(x) && x.flags & STYLE == Flags::empty() && x.fg == Color::Named(NamedColor::Foreground),
+                    plain_fg: x.fg == Color::Named(NamedColor::Foreground) && !x.flags.contains(Flags::DIM),
+                }
+            })
+            .collect()
+    }
+
+    /// Draw `items` on `row` from column `col`: original cells, or characters
+    /// in the pen at the cursor (underlined when `mark`). Ends with the default
+    /// pen and no link; the caller restores the cursor.
+    pub fn compose(&self, row: usize, col: usize, items: &[Src], mark: bool) -> String {
+        let g = self.term.grid();
+        if row >= g.screen_lines() {
+            return String::new();
+        }
+        let r = &g[Line(row as i32)];
+        let mut typed = Pen::of(&g.cursor.template);
+        if mark {
+            typed.flags.insert(Flags::UNDERLINE);
+        }
+        let mut out = format!("\x1b[{};{}H", row + 1, col + 1);
+        let (mut pen, mut link) = (Pen::default(), None);
+        sgr(&mut out, &pen);
+        for it in items {
+            match *it {
+                Src::Orig(c) if c < g.columns() => cell(&mut out, &r[Column(c)], &mut pen, &mut link),
+                Src::Orig(_) | Src::Skip => {}
+                Src::Char(_) | Src::Blank => {
+                    if link.is_some() {
+                        out.push_str("\x1b]8;;\x1b\\");
+                        link = None;
+                    }
+                    if pen != typed {
+                        sgr(&mut out, &typed);
+                        pen = typed.clone();
+                    }
+                    out.push(if let Src::Char(ch) = *it { ch } else { ' ' });
+                }
+            }
+        }
+        end_line(&mut out, &mut pen, &mut link);
+        out
+    }
+
+    /// Cells `col..col+width` of a row, blanks included, for drawing a view
+    /// of the screen at another place. A wide character cut by an edge
+    /// becomes a space. Starts and ends with the default pen.
+    pub fn render_row(&self, row: usize, col: usize, width: usize) -> String {
+        let g = self.term.grid();
+        let mut out = String::new();
+        let (mut pen, mut link) = (Pen::default(), None);
+        sgr(&mut out, &pen);
+        if row >= g.screen_lines() {
+            out.push_str(&" ".repeat(width));
+            return out;
+        }
+        let r = &g[Line(row as i32)];
+        let cols = g.columns();
+        let end = col + width;
+        let mut c = col;
+        while c < end {
+            if c >= cols {
+                end_line(&mut out, &mut pen, &mut link);
+                out.push_str(&" ".repeat(end - c));
+                break;
+            }
+            let x = &r[Column(c)];
+            let cut = (x.flags.contains(Flags::WIDE_CHAR_SPACER) && c == col)
+                || (x.flags.contains(Flags::WIDE_CHAR) && c + 1 >= end)
+                || x.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+            if cut {
+                let mut blank_cell = x.clone();
+                blank_cell.c = ' ';
+                blank_cell.flags.remove(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
+                cell(&mut out, &blank_cell, &mut pen, &mut link);
+            } else {
+                cell(&mut out, x, &mut pen, &mut link);
+            }
+            c += 1;
+        }
+        end_line(&mut out, &mut pen, &mut link);
+        out
+    }
+
     /// Origin mode (DECOM) is set. Then cursor positions are relative to the
     /// scroll region, which alacritty does not expose.
     pub fn origin_mode(&self) -> bool {
@@ -175,27 +323,26 @@ impl Mirror {
 
     /// Escape sequences that bring a terminal to the current state.
     ///
-    /// `history`: also send the scrollback (the client has nothing yet).
-    /// `clean`: the client screen is blank with the cursor at the top left.
-    /// If not, the old screen is first scrolled into the terminal's scrollback.
-    pub fn snapshot(&mut self, history: bool, clean: bool) -> Vec<u8> {
+    /// `history`: None: the screen only. Some(n): also up to n lines of
+    /// scrollback, and (on the alternate screen) the main screen under it.
+    pub fn snapshot(&mut self, history: Option<usize>, prep: Prep) -> Vec<u8> {
         let rows = self.term.screen_lines();
         let mut out = String::from(RESET);
-        let prepare = |out: &mut String| {
-            if clean {
-                out.push_str("\x1b[H");
-            } else {
+        let prepare = |out: &mut String| match prep {
+            Prep::Blank => out.push_str("\x1b[H"),
+            Prep::Clear => out.push_str("\x1b[H"),
+            Prep::Scroll => {
                 out.push_str(&format!("\x1b[{rows};1H"));
                 out.push_str(&"\n".repeat(rows));
                 out.push_str("\x1b[H");
             }
         };
         if self.alt_screen() {
-            if history {
+            if let Some(n) = history {
                 out.push_str("\x1b[?1049l");
                 prepare(&mut out);
                 if let Some(p) = &self.primary {
-                    flow(&mut out, p, true);
+                    flow(&mut out, p, n, prep == Prep::Clear);
                     cursor_pos(&mut out, p);
                     out.push_str("\x1b[0m");
                 }
@@ -205,13 +352,13 @@ impl Mirror {
             let (mut pen, mut link) = (Pen::default(), None);
             for r in 0..rows {
                 out.push_str(&format!("\x1b[{};1H", r + 1));
-                line(&mut out, &g[Line(r as i32)], g.columns(), &mut pen, &mut link, false);
+                let _ = line(&mut out, &g[Line(r as i32)], g.columns(), &mut pen, &mut link, false);
             }
             end_line(&mut out, &mut pen, &mut link);
         } else {
             out.push_str("\x1b[?1049l");
             prepare(&mut out);
-            flow(&mut out, self.term.grid(), history);
+            flow(&mut out, self.term.grid(), history.unwrap_or(0), prep == Prep::Clear);
         }
         out.push_str(&palette(&self.term));
         out.push_str(&self.state());
@@ -220,6 +367,27 @@ impl Mirror {
 
     /// Modes, title, cursor shape, cursor position, pen and cursor visibility.
     fn state(&self) -> String {
+        let mut out = self.input_modes();
+        out.push_str(&cursor_shape(self.term.cursor_style()));
+        if let Some(t) = self.title() {
+            out.push_str(&format!("\x1b]2;{t}\x07"));
+        }
+        out.push_str(&self.cursor_restore());
+        out
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.title.0.lock().unwrap().as_ref().map(|t| t.chars().filter(|c| !c.is_control()).collect())
+    }
+
+    pub fn cursor_shape(&self) -> String {
+        cursor_shape(self.term.cursor_style())
+    }
+
+    /// The modes that change what the terminal sends: keys, mouse, paste,
+    /// focus. Also wrap and new-line modes. (Sets modes that are on; a
+    /// terminal after RESET has the rest off.)
+    pub fn input_modes(&self) -> String {
         let mut out = String::new();
         let mode = *self.term.mode();
         for (m, on) in [
@@ -258,12 +426,6 @@ impl Mirror {
         if kitty != 0 {
             out.push_str(&format!("\x1b[>{kitty}u"));
         }
-        out.push_str(&cursor_shape(self.term.cursor_style()));
-        if let Some(t) = self.title.0.lock().unwrap().as_ref() {
-            let t: String = t.chars().filter(|c| !c.is_control()).collect();
-            out.push_str(&format!("\x1b]2;{t}\x07"));
-        }
-        out.push_str(&self.cursor_restore());
         out
     }
 
@@ -502,31 +664,43 @@ fn end_line(out: &mut String, pen: &mut Pen, link: &mut Option<Hyperlink>) {
 
 /// Write one row. Trailing blank cells are left out, except when the row
 /// continues on the next row (soft wrap) or `full` is set. Returns true for a
-/// soft wrap.
-fn line(out: &mut String, r: &Row<Cell>, cols: usize, pen: &mut Pen, link: &mut Option<Hyperlink>, full: bool) -> bool {
+/// soft wrap, and the number of columns written.
+fn line(out: &mut String, r: &Row<Cell>, cols: usize, pen: &mut Pen, link: &mut Option<Hyperlink>, full: bool) -> (bool, usize) {
     let wrapped = r[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
     let end = if wrapped || full { cols } else { (0..cols).rev().find(|&c| !blank(&r[Column(c)])).map_or(0, |c| c + 1) };
     for c in 0..end {
         cell(out, &r[Column(c)], pen, link);
     }
-    wrapped
+    (wrapped, end)
 }
 
 /// Print rows top to bottom from a blank screen with CR LF, so that the
 /// terminal scrolls the first rows into its own scrollback.
-fn flow(out: &mut String, g: &Grid<Cell>, history: bool) {
+/// `erase`: write over old text (erase the rest of each line).
+fn flow(out: &mut String, g: &Grid<Cell>, history: usize, erase: bool) {
     let rows = g.screen_lines() as i32;
-    let start = if history { -(g.history_size() as i32) } else { 0 };
+    let start = -(g.history_size().min(history) as i32);
     let (mut pen, mut link) = (Pen::default(), None);
+    // A full row leaves the cursor waiting to wrap at the last column: EL
+    // there would erase the last character.
+    let mut full = false;
     for l in start..rows {
-        let wrapped = line(out, &g[Line(l)], g.columns(), &mut pen, &mut link, false);
+        let (wrapped, end) = line(out, &g[Line(l)], g.columns(), &mut pen, &mut link, false);
+        full = end >= g.columns();
         if !wrapped && l != rows - 1 {
             // A new line gets the current background in many terminals.
             end_line(out, &mut pen, &mut link);
+            if erase && !full {
+                out.push_str("\x1b[K");
+            }
             out.push_str("\r\n");
         }
     }
     end_line(out, &mut pen, &mut link);
+    // All screen rows were written: the last one is the bottom row.
+    if erase && !full {
+        out.push_str("\x1b[K");
+    }
 }
 
 fn cursor_pos(out: &mut String, g: &Grid<Cell>) {
@@ -585,7 +759,7 @@ mod tests {
 
     fn roundtrip(m: &mut Mirror, history: bool) -> Mirror {
         let (c, r) = m.size();
-        let snap = m.snapshot(history, false);
+        let snap = m.snapshot(history.then_some(usize::MAX), Prep::Scroll);
         let mut n = Mirror::new(c as u16, r as u16, 1000);
         n.feed(b"old local text that must not stay\r\n$ ");
         n.feed(&snap);
@@ -696,7 +870,7 @@ mod tests {
     fn title_palette_and_cursor_shape() {
         let mut m = Mirror::new(20, 3, 0);
         m.feed(b"\x1b]2;my title\x07\x1b]4;1;rgb:12/34/56\x1b\\\x1b[5 q");
-        let snap = String::from_utf8(m.snapshot(false, true)).unwrap();
+        let snap = String::from_utf8(m.snapshot(None, Prep::Blank)).unwrap();
         assert!(snap.contains("\x1b]2;my title\x07"));
         assert!(snap.contains("\x1b]4;1;rgb:12/34/56"));
         assert!(snap.contains("\x1b[5 q"));

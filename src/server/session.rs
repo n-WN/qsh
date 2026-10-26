@@ -9,9 +9,12 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    os::fd::OwnedFd,
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -54,6 +57,16 @@ impl Ring {
             self.base += n as u64;
         }
     }
+    /// All bytes in the ring (for a daemon upgrade).
+    pub fn contents(&self) -> Vec<u8> {
+        let (a, b) = self.buf.as_slices();
+        [a, b].concat()
+    }
+    pub fn restore(cap: usize, base: u64, data: &[u8]) -> Ring {
+        let mut r = Ring { buf: VecDeque::with_capacity(data.len()), base, cap };
+        r.buf.extend(data);
+        r
+    }
     pub fn read(&self, from: u64, max: usize) -> Option<Vec<u8>> {
         if from < self.base || from > self.head() {
             return None;
@@ -91,6 +104,11 @@ pub struct ClientSlot {
     /// Output offset that the client acknowledged, and when it last moved.
     pub acked: u64,
     pub ack_at: Instant,
+    /// Bytes of input received from this client, over all its connections.
+    pub input_seen: u64,
+    /// An input acknowledgement to send: (input count, ring head). It goes
+    /// out after the output up to that head, so it follows the echo.
+    pub echo: Option<(u64, u64)>,
 }
 
 pub struct State {
@@ -99,6 +117,10 @@ pub struct State {
     pub clients: BTreeMap<u64, ClientSlot>,
     pub active: Option<u64>,
     pub size: [u16; 4],
+    /// Ring head when the size last changed: output after it is for the new size.
+    pub size_at: u64,
+    /// pty mode bits (`proto::mode`).
+    pub mode: u8,
 }
 
 pub struct Session {
@@ -108,6 +130,8 @@ pub struct Session {
     pub created: u64,
     master: OwnedFd,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Input bytes not yet written to the pty.
+    input_pending: Arc<AtomicUsize>,
     pub st: Mutex<State>,
     /// Signalled when an acknowledgement arrives (wakes the paused pty reader).
     pub cv: Condvar,
@@ -115,6 +139,24 @@ pub struct Session {
     /// Changes on each acknowledgement (wakes output loops).
     pub ack: watch::Sender<u64>,
     pub exit: watch::Sender<Option<i32>>,
+    /// Set before the daemon replaces its program: the reader stops reading.
+    pause: AtomicBool,
+    /// The reader waits and holds no unread output.
+    parked: AtomicBool,
+}
+
+/// What a session needs to continue in a new daemon process.
+pub struct Parts {
+    pub name: String,
+    pub command: String,
+    pub pid: i32,
+    pub created: u64,
+    pub master: OwnedFd,
+    pub ring: Ring,
+    pub mirror: crate::vt::Mirror,
+    pub clients: BTreeMap<u64, ClientSlot>,
+    pub active: Option<u64>,
+    pub size: [u16; 4],
 }
 
 impl Session {
@@ -127,50 +169,84 @@ impl Session {
         size: [u16; 4],
     ) -> Result<Arc<Session>> {
         let p = pty::spawn(argv, login, env, cwd, size)?;
+        // The child is reaped by pid (waitpid), also after a daemon upgrade.
         let pid = p.child.id() as i32;
-        let reader = p.master.try_clone()?;
-        let writer = p.master.try_clone()?;
-        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let sess = Arc::new(Session {
+        drop(p.child);
+        Ok(Session::launch(Parts {
             name: name.to_string(),
             command: argv.join(" "),
             pid,
             created: crate::paths::now_secs(),
             master: p.master,
+            ring: Ring::new(RING_CAP),
+            mirror: crate::vt::Mirror::new(size[0], size[1], SCROLLBACK),
+            clients: BTreeMap::new(),
+            active: None,
+            size,
+        }))
+    }
+
+    /// Start the threads of a session: pty input, pty output, mode watch.
+    pub fn launch(p: Parts) -> Arc<Session> {
+        let head = p.ring.head();
+        let input_pending = Arc::new(AtomicUsize::new(0));
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer = p.master.try_clone().expect("dup pty");
+        let reader = p.master.try_clone().expect("dup pty");
+        let sess = Arc::new(Session {
+            name: p.name,
+            command: p.command,
+            pid: p.pid,
+            created: p.created,
+            master: p.master,
             input_tx,
+            input_pending: input_pending.clone(),
             st: Mutex::new(State {
-                ring: Ring::new(RING_CAP),
-                mirror: crate::vt::Mirror::new(size[0], size[1], SCROLLBACK),
-                clients: BTreeMap::new(),
-                active: None,
-                size,
+                ring: p.ring,
+                mirror: p.mirror,
+                clients: p.clients,
+                active: p.active,
+                size: p.size,
+                size_at: head,
+                mode: 0,
             }),
             cv: Condvar::new(),
-            head: watch::Sender::new(0),
+            head: watch::Sender::new(head),
             ack: watch::Sender::new(0),
             exit: watch::Sender::new(None),
+            pause: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
         });
 
         std::thread::spawn(move || {
             use std::io::Write;
             let mut f = std::fs::File::from(writer);
             for data in input_rx {
-                if f.write_all(&data).is_err() {
+                let ok = f.write_all(&data).is_ok();
+                input_pending.fetch_sub(data.len(), Ordering::SeqCst);
+                if !ok {
                     break;
                 }
             }
         });
 
         let s = sess.clone();
-        let mut child = p.child;
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 {
                     let mut st = s.st.lock().unwrap();
-                    while st.output_blocked() {
+                    while st.output_blocked() || s.pause.load(Ordering::SeqCst) {
+                        s.parked.store(s.pause.load(Ordering::SeqCst), Ordering::SeqCst);
                         st = s.cv.wait_timeout(st, Duration::from_millis(100)).unwrap().0;
                     }
+                    s.parked.store(false, Ordering::SeqCst);
+                }
+                // Wait with a timeout, so that a pause request is seen.
+                let mut pfd = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+                if n == 0 || (n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted) {
+                    continue;
                 }
                 match nix::unistd::read(&reader, &mut buf) {
                     Ok(0) => break,
@@ -187,20 +263,79 @@ impl Session {
                     Err(_) => break,
                 }
             }
-            let code = match child.wait() {
-                Ok(st) => {
-                    use std::os::unix::process::ExitStatusExt;
-                    st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
+            use nix::sys::wait::{WaitStatus, waitpid};
+            let code = loop {
+                match waitpid(nix::unistd::Pid::from_raw(s.pid), None) {
+                    Ok(WaitStatus::Exited(_, c)) => break c,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
+                    Ok(_) => continue,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(_) => break -1,
                 }
-                Err(_) => -1,
             };
             s.exit.send_replace(Some(code));
         });
-        Ok(sess)
+
+        // The pty mode changes when programs start and stop; they print
+        // something then. Look at it shortly after output.
+        let weak: Weak<Session> = Arc::downgrade(&sess);
+        let mut head_rx = sess.head.subscribe();
+        tokio::spawn(async move {
+            while head_rx.changed().await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                head_rx.borrow_and_update();
+                let Some(s) = weak.upgrade() else { break };
+                s.update_mode();
+            }
+        });
+        sess
+    }
+
+    /// Read the pty mode; wake the output loops when it changed.
+    pub fn update_mode(&self) -> u8 {
+        let m = pty::mode(&self.master);
+        let changed = {
+            let mut st = self.st.lock().unwrap();
+            let c = st.mode != m;
+            st.mode = m;
+            c
+        };
+        if changed {
+            self.ack.send_modify(|x| *x = x.wrapping_add(1));
+        }
+        m
+    }
+
+    /// Stop reading the pty and wait until the reader holds no output and all
+    /// input is written. For a daemon upgrade.
+    pub fn quiesce(&self, timeout: Duration) -> bool {
+        self.pause.store(true, Ordering::SeqCst);
+        self.cv.notify_all();
+        let end = Instant::now() + timeout;
+        while Instant::now() < end {
+            if (self.parked.load(Ordering::SeqCst) || self.exit.borrow().is_some()) && self.input_pending.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    pub fn resume_reading(&self) {
+        self.pause.store(false, Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+
+    pub fn master_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.master.as_fd()
     }
 
     pub fn write_input(&self, data: Vec<u8>) {
-        let _ = self.input_tx.send(data);
+        self.input_pending.fetch_add(data.len(), Ordering::SeqCst);
+        let n = data.len();
+        if self.input_tx.send(data).is_err() {
+            self.input_pending.fetch_sub(n, Ordering::SeqCst);
+        }
     }
 
     pub fn resize(&self, st: &mut State, size: [u16; 4]) {
@@ -209,7 +344,9 @@ impl Session {
         }
         st.mirror.resize(size[0], size[1]);
         st.size = size;
+        st.size_at = st.ring.head();
         pty::resize(&self.master, size[0], size[1], size[2], size[3]);
+        self.ack.send_modify(|x| *x = x.wrapping_add(1));
     }
 
     /// Make a full-screen program redraw itself at the same size: change the
@@ -234,10 +371,15 @@ impl Session {
 
     /// Make `id` the active client: its size drives the pty size.
     pub fn activate(&self, st: &mut State, id: u64) {
+        let changed = st.active != Some(id);
         st.active = Some(id);
         if let Some(c) = st.clients.get(&id) {
             let size = c.size;
             self.resize(st, size);
+        }
+        if changed {
+            // Every client learns who sets the size.
+            self.ack.send_modify(|x| *x = x.wrapping_add(1));
         }
     }
 

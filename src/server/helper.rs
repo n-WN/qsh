@@ -19,6 +19,7 @@ use tokio::{
 use crate::{
     paths,
     proto::{self, LocalReply, LocalReq},
+    version::{self, Build},
 };
 
 pub struct HelperArgs {
@@ -82,15 +83,47 @@ pub async fn run(a: HelperArgs) -> Result<()> {
         println!("{}", serde_json::to_string(&rep.sessions)?);
         return Ok(());
     }
+    // A daemon of an older build gives its sessions to this program.
+    if let Ok(rep) = local_request(a.port, true, &LocalReq::Info).await
+        && let Some(running) = Build::parse(&rep.build)
+        && Build::current().replaces(&running)
+    {
+        upgrade_daemon(a.port).await;
+    }
     let rep = local_request(a.port, true, if a.token { &LocalReq::Token } else { &LocalReq::Info }).await?;
     let token = if rep.token.is_empty() { "-".to_string() } else { rep.token.clone() };
     let mut out = tokio::io::stdout();
-    out.write_all(format!("QSH-CONNECT 1 {} {} {}\n", rep.port, rep.fp, token).as_bytes()).await?;
+    let line = format!("QSH-CONNECT 1 {} {} {} {} {}\n", rep.port, rep.fp, token, Build::current(), version::platform());
+    out.write_all(line.as_bytes()).await?;
     out.flush().await?;
     if a.tunnel {
         relay(rep.port, out).await?;
     }
     Ok(())
+}
+
+/// Ask the daemon to continue with this program, then wait until it does.
+async fn upgrade_daemon(port: Option<u16>) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let req = LocalReq::Upgrade { exe: exe.display().to_string() };
+    if let Ok(mut s) = connect_daemon(port, false).await
+        && proto::write_msg(&mut s, &req).await.is_ok()
+    {
+        // On success the daemon does not answer: the stream closes at exec.
+        if let Ok(rep) = proto::read_msg::<_, LocalReply>(&mut s).await {
+            eprintln!("qsh: cannot upgrade the daemon: {}", rep.error.unwrap_or_default());
+            return;
+        }
+    }
+    let want = Build::current();
+    for _ in 0..60 {
+        if let Ok(rep) = local_request(port, false, &LocalReq::Info).await
+            && Build::parse(&rep.build).as_ref() == Some(&want)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A routable local address for the relay, not loopback. QUIC keeps the local

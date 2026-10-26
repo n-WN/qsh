@@ -97,7 +97,8 @@ mkdir -p "$b/{BUILD_ID}"
 cd "$b/{BUILD_ID}"
 tar xf -
 cd qsh
-CARGO_TARGET_DIR="$b/target" "$c" build --release --locked 2>&1
+# Low priority: the server may have other work.
+CARGO_TARGET_DIR="$b/target" nice -n 10 "$c" build --release --locked 2>&1
 v="$HOME/.qsh/versions/{BUILD_ID}"
 mkdir -p "$v"
 cp "$b/target/release/qsh" "$v/qsh.new"

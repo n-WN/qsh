@@ -55,6 +55,12 @@ and one round trip.
   8 RTT (0.5–1.5 s), the SSH login starts too, and the first that works wins;
   the other one stops (its ssh process is killed). If the last login went
   through the SSH tunnel (no UDP path), SSH starts at once.
+- On a lossy link one attempt can fail although the link works (QUIC's
+  retransmission timers back off). The direct path then tries again with a
+  new connection, for up to 60 s, and when SSH fails, the client waits for
+  the direct path. In the lab, 6 of 6 starts worked at 25 % loss, where ssh
+  failed 1 of 3. (A start that makes a session, `-n` or a command, does not
+  try twice: the first attempt may have made it.)
 - If the daemon rejects the token, the client deletes it and logs in over
   SSH.
 - The token belongs to the daemon (its certificate): a login over SSH to the
@@ -151,11 +157,23 @@ during the view go into its scrollback.
 
 ### Flow control
 
-The server keeps unacknowledged output per connection to about two congestion
-windows (minimum 256 KB). It stops reading the pty while the active client is
-more than 1 MB behind, so the program blocks on write as with ssh and no
-output is lost. A disconnected client never stops the session; a client that
-lags far behind gets a snapshot.
+Everything that waits in a queue of the path goes before your next key or
+Ctrl-C. So the congestion controller is BBR: it measures the bottleneck rate
+and the round trip and does not fill the queues, and a random loss does not
+slow it down (Cubic, quinn's default, does both). Two changes to quinn's BBR:
+
+- It starts with 14.7 KB in flight (RFC 9002), not 240 KB: that was 2 s in
+  the queue of a 1 Mbit/s link before BBR knew the rate.
+- Its window never falls below 16 packets (19 KB). On an idle connection BBR
+  estimates the rate from the pings alone, and its window fell to 4 packets:
+  a few lost pings then blocked pings and keys until loss detection, seconds
+  on a bad link.
+
+The server keeps unacknowledged output per connection to about two
+congestion windows (minimum 32 KB, 0.26 s at 1 Mbit/s). It stops reading the
+pty while the active client is more than 1 MB behind, so the program blocks
+on write as with ssh and no output is lost. A disconnected client never stops
+the session; a client that lags far behind gets a snapshot.
 
 Ctrl-C during a flood: when the server reads an interrupt key from a client
 (byte `0x03`, or Ctrl-C in the kitty keyboard encoding), it waits 40 ms for
@@ -434,21 +452,19 @@ to the prompt, key echo, output throughput, and Ctrl-C during a flood:
 tests/bench/bench.py user@host --qsh target/release/qsh --ssh "ssh -i ~/.ssh/key" --port P
 ```
 
-Results from a macOS client to a Linux server, at 55–90 ms RTT with about
-4 % packet loss on the path:
+Results from a macOS client to a Linux server over the internet (about
+60 ms RTT, some packet loss), with BBR:
 
 | Test | ssh | qsh |
 |---|---|---|
-| Startup to prompt (median of 8) | 1303 ms | 310 ms (fast start) |
-| Key echo (median of 20) | 76 ms | 0 ms (local echo); 51 ms with `--predict never` |
-| `seq 1 2000000` (16.9 MB) | 29.6 s, 0.6 MB/s | 8.3 s, 2.0 MB/s |
-| Ctrl-C in a flood, until the next command ran (1 run) | 1532 ms | 314 ms |
+| Startup to prompt (median of 5) | 1016 ms | 223 ms (fast start) |
+| Key echo (median of 20) | 66 ms | 0 ms (local echo); 47 ms with `--predict never` |
+| `seq 1 2000000` (16.9 MB) | 11.4 s, 1.5 MB/s | 5.6 s, 3.0 MB/s |
+| Ctrl-C in a flood, until the next command ran (1 run) | 492 ms | 235 ms |
 
-On this path, `ssh host cat file` moved 0.8 MB/s: the limit of ssh is its
-TCP connection, not the terminal. A daemon with `QSH_CC=bbr` was not faster
-than the default (Cubic). The network changes from run to run (the ssh
-startup median was 2064 ms in another run), so compare clients in the same
-run.
+The network changes from day to day: on another day, with about 4 % loss,
+ssh moved 0.6 MB/s and needed 1.5 s for the Ctrl-C (qsh with Cubic: 2.0 MB/s
+and 0.3 s). Compare clients in the same run.
 
 ### Weak networks
 
@@ -471,22 +487,36 @@ tests/netlab/lab.sh stop
 Profiles (one way; the round trip is twice the delay): fiber 10 ms; wifi
 20±10 ms, 1 % loss; lte 40±20 ms, 3 % loss in bursts; bad 80±40 ms, 10 %
 loss, 2 % reordering; awful 150±60 ms, 25 % loss; slow 1 Mbit/s with a 2 s
-queue. Results:
+queue; slow-shallow 1 Mbit/s with a 0.2 s queue; dsl 10 Mbit/s with a 0.5 s
+queue. Results (ranges are from several runs):
 
 | Test | ssh | qsh |
 |---|---|---|
-| Startup, lte / bad / awful | 1.2 s / 2.5 s / 12.9 s (1 of 3 failed) | 0.3 s / 0.5 s / 4.0 s |
-| Key echo, lte / awful (median) | 111 ms / 1692 ms | 0 ms (local echo); without: 96 ms / 1115 ms |
-| 60,000 lines, lte / bad / awful | 27 s / not done in 10 min / not done in 10 min | 7.5 s / 26 s / 48 s, each line once, in order |
+| Startup, lte / bad / awful (median) | 1.2 s / 2.5 s / 12.9 s (1 of 3 failed) | 0.29 s / 0.45–0.5 s / 2.6–3.4 s (6 of 6) |
+| Key echo, lte / bad / awful (median) | 0.11–0.12 s / 0.22–0.39 s / 1.2–1.7 s | 0 ms (local echo); without: 82–100 ms / 0.18–0.22 s / 0.4–1.1 s |
+| 60,000 lines, lte / bad / awful | 27 s / not done in 10 min / not done in 10 min | 0.7–0.9 s / 1.7–2.5 s / 3.4–9.1 s, each line once, in order |
 | 300 typed characters in pieces, lte to awful | ran once | ran once |
-| Outage 3 s / 8 s / 20 s / 45 s: output again after | 1.7 s / 0.9 s / 9.9 s / 16.2 s | 0.09 s / 0.06 s / 0.37 s / 0.36 s |
+| Outage 3 s / 8 s / 20 s / 45 s: output again after | 1.7 s / 0.9 s / 9.9 s / 16.2 s | 0.1 s / 0.1 s / 0.4–0.5 s / 0.2–1.1 s |
 | Command typed during the outage | ran once | ran once |
-| UDP blocked during a session | – | output on the SSH tunnel after 5.1 s; back on UDP 0.5 s after UDP works |
-| Ctrl-C in a flood, lte / slow | 7.6 s / 9.9 s | 1.0 s / 6.2 s |
-| 60 s idle, lte to awful | – | no "no reply" badge |
+| UDP blocked during a session | – | output on the SSH tunnel after 5.1 s; back on UDP 0.3–0.5 s after UDP works |
+| Ctrl-C in a flood, lte / slow (2 s queue) | 7.6 s / 9.9 s | 0.14–0.34 s / 0.37 s |
+| 60 s idle: "no reply" badges, bad / awful | – | 0–1 / 2–5, as with Cubic (on awful the link is silent for more than 2.5 s at times) |
+| 10 minutes of random profiles and outages up to 15 s | every line once, every command once | every line once, every command once |
 
-On the slow link, most of qsh's 6.2 s is output that was already in the
-2 s queue and in flight when Ctrl-C arrived.
+Output rate (3.4 MB) and Ctrl-C after 4 s of flood, by link (`--only flow`):
+
+| Link | ssh | qsh with Cubic (before) | qsh with BBR |
+|---|---|---|---|
+| fiber (no rate limit) | 9.6 MB/s, 27 ms | 2.1 MB/s, 92 ms | 6.5–8.0 MB/s, 38–40 ms |
+| dsl | 0.74 MB/s, 0.88 s | 1.12 MB/s, 0.86 s | 1.13–1.16 MB/s, 0.25–0.28 s |
+| lte | 0.10 MB/s, 13.1 s | 0.22 MB/s, 2.2 s | 1.96–2.67 MB/s, 0.21–0.22 s |
+| slow-shallow | 0.08 MB/s, 9.3 s | 0.12 MB/s, 2.4 s | 0.12 MB/s, 0.31–0.37 s |
+| slow | 0.08 MB/s, 8.6 s | 0.12 MB/s, 4.2 s | 0.12 MB/s, 0.37–0.44 s |
+
+On the fiber profile, 3.4 MB is short: BBR starts with 14.7 KB in flight
+and needs a few round trips to reach the rate. With 25.9 MB, qsh moved
+9.9 MB/s there, as ssh. On the internet path above, qsh moved twice as much
+as ssh.
 
 ### Formal model
 
@@ -528,6 +558,7 @@ On the slow link, most of qsh's 6.2 s is output that was already in the
 `QSH_LOG=/tmp/qsh.log` writes connection events and startup times;
 `QSH_TRACE=quinn=debug` adds quinn tracing. `QSH_DUMP=/tmp/qsh.out` writes
 the raw session output that the client gets (and the input that it sends, to
-`/tmp/qsh.out.in`). `QSH_CC=bbr|newreno` changes the congestion controller of
-the process (default Cubic); the daemon sends the output. `kill -USR1` / `kill -USR2` on the client moves
-the connection to a new UDP socket / to the SSH tunnel.
+`/tmp/qsh.out.in`). `QSH_CC=cubic|newreno` changes the congestion controller
+of the process (default BBR); the daemon sends the output. `kill -USR1` /
+`kill -USR2` on the client moves the connection to a new UDP socket / to the
+SSH tunnel.

@@ -14,6 +14,8 @@ hex = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl", "user", "hostname"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# Only for the congestion controller trait (RttEstimator is not in quinn).
+quinn-proto = { version = "0.11", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }

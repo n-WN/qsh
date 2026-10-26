@@ -910,6 +910,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring",
  "rustls",

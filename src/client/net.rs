@@ -447,16 +447,18 @@ pub async fn race(rs: RaceSpec, helper: Option<Helper>, tunnel_delay: Duration) 
 }
 
 /// Like `race`, for a reconnect: it does not give up. A fresh UDP handshake
-/// (new socket, last round-trip time) starts every second, and up to three
-/// overlap, so the session continues soon after the network comes back. SSH
-/// tunnel attempts run at the same time, one after the other.
+/// (new socket, last round-trip time) starts every 0.5 s, and up to six
+/// overlap: when the network comes back, a first packet goes out within
+/// 0.5 s (the retransmissions of older attempts back off). SSH tunnel
+/// attempts run at the same time, one after the other.
 pub async fn race_until_up(rs: RaceSpec) -> Candidate {
     let direct = async {
         let mut tries = tokio::task::JoinSet::new();
-        let mut every = tokio::time::interval(Duration::from_secs(1));
+        let mut every = tokio::time::interval(Duration::from_millis(500));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = every.tick(), if tries.len() < 3 => {
+                _ = every.tick(), if tries.len() < 6 => {
                     let (addr, fp, rtt) = (rs.addr, rs.fp.clone(), rs.rtt);
                     tries.spawn(async move {
                         let ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(&addr)?, Arc::new(quinn::TokioRuntime))?;

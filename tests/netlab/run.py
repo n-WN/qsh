@@ -16,6 +16,8 @@ Each test sets a network profile in the emulator, runs the clients in a pty
              works again (qsh moves back)
   ctrlc      Ctrl-C during a flood on a slow link with a long queue
   idle       60 s without input on a lossy link: "no reply" badges
+  flow       on links with a rate limit and a queue: output rate (3.4 MB),
+             and Ctrl-C during a flood
   revoke     a stolen device token works until `qsh devices --revoke`; then
              the thief's connection ends, its resume token and the token
              stop working, and the user's next start logs in over SSH
@@ -25,7 +27,7 @@ Each test sets a network profile in the emulator, runs the clients in a pty
 For qsh, the output checks use the session stream that the client received
 (QSH_DUMP), so that the status overlay does not change the text.
 
-Usage: run.py [--lab DIR] [--only test,...] [--soak MINUTES]
+Usage: run.py [--lab DIR] [--only test,...] [--kinds ssh,qsh] [--soak MINUTES]
 """
 
 import argparse
@@ -56,6 +58,8 @@ PROFILES = {
     "bad": {"delay_ms": 80, "jitter_ms": 40, "loss": 0.10, "burst": 4, "reorder": 0.02},
     "awful": {"delay_ms": 150, "jitter_ms": 60, "loss": 0.25, "burst": 5},
     "slow": {"delay_ms": 30, "rate_kbit": 1000, "queue_ms": 2000},
+    "slow-shallow": {"delay_ms": 30, "rate_kbit": 1000, "queue_ms": 200},
+    "dsl": {"delay_ms": 20, "rate_kbit": 10000, "queue_ms": 500},
     "udp-blocked": {"delay_ms": 25, "block_udp": True},
 }
 
@@ -157,6 +161,9 @@ class Term:
 
 class Client:
     def __init__(self, kind, name):
+        # Each kind of client gets its own session: a late "exit" of one
+        # client must not end the session of the next.
+        name = f"{name}-{kind}"
         self.kind, self.name = kind, name
         self.dump = f"{L}/dump-{name}"
         env = dict(os.environ)
@@ -260,18 +267,25 @@ def t_echo():
     for prof in ["fiber", "lte", "bad", "awful"]:
         set_profile(PROFILES[prof])
         for kind in ["ssh", "qsh", "qsh-np"]:
+            if kind != "ssh" and "qsh" not in KINDS or kind == "ssh" and "ssh" not in KINDS:
+                continue
             c = Client(kind, f"echo-{prof}")
-            c.start()
             times = []
-            for _ in range(10):
-                c.term.buf = b""
-                t0 = time.monotonic()
-                c.term.send(b"Q")
-                c.term.wait(lambda b: b"Q" in b, 30)
-                times.append(time.monotonic() - t0)
-                c.term.run_for(0.2)
-                c.term.send(b"\x7f")
-                c.term.run_for(0.4)
+            try:
+                c.start()
+                for _ in range(10):
+                    c.term.buf = b""
+                    t0 = time.monotonic()
+                    c.term.send(b"Q")
+                    c.term.wait(lambda b: b"Q" in b, 30)
+                    times.append(time.monotonic() - t0)
+                    c.term.run_for(0.2)
+                    c.term.send(b"\x7f")
+                    c.term.run_for(0.4)
+            except (TimeoutError, EOFError) as e:
+                report("echo", prof, kind, "fail", False, f"{type(e).__name__} after {len(times)} keys: {str(e)[-100:]}")
+                c.stop()
+                continue
             c.stop()
             times.sort()
             report("echo", prof, kind, f"{times[5] * 1000:.0f} ms", True, f"p90 {times[8] * 1000:.0f} ms")
@@ -402,6 +416,36 @@ def t_ctrlc():
             c.stop()
 
 
+def t_flow():
+    for prof in ["fiber", "dsl", "lte", "slow-shallow", "slow"]:
+        set_profile(PROFILES[prof])
+        for kind in KINDS:
+            c = Client(kind, f"flow-{prof}")
+            c.start()
+            t0 = time.monotonic()
+            c.term.all = 0
+            c.term.send(b"seq 1 500000; echo END-$((6*7))\r")
+            try:
+                c.term.wait(lambda b: b"END-42" in b, 300)
+                dt = time.monotonic() - t0
+                rate = f"{c.term.all / dt / 1e6:.2f} MB/s"
+            except (TimeoutError, EOFError):
+                rate = "fail"
+            c.term.send(b"yes 0123456789012345678901234567890123456789012345678901234567890123456789\r")
+            c.term.run_for(4)
+            c.term.buf = b""
+            t0 = time.monotonic()
+            c.term.send(b"\x03")
+            c.term.send(b"echo STOP-$((5*9))\r")
+            try:
+                c.term.wait(lambda b: b"STOP-45" in b, 300)
+                stop = f"{(time.monotonic() - t0) * 1000:.0f} ms"
+            except (TimeoutError, EOFError):
+                stop = "fail"
+            report("flow", prof, kind, rate, rate != "fail" and stop != "fail", f"Ctrl-C {stop}")
+            c.stop()
+
+
 def t_idle():
     for prof in ["lte", "bad", "awful"]:
         set_profile(PROFILES[prof])
@@ -523,6 +567,12 @@ def t_soak(minutes):
     for k, c in cs.items():
         try:
             c.term.wait(lambda b: b"QC-END" in b, 180)
+            # Commands can still be on the way (TCP retransmits late after
+            # an outage): wait until all are there, at most 60 s.
+            end = time.monotonic() + 60
+            while len(read_lines(typed_file("soak-" + k))) < len(words[k]) and time.monotonic() < end:
+                for c2 in cs.values():
+                    c2.term.pump(0.05)
             c.term.run_for(1)
             ok, note = check(c.numbers(COUNTER))
             got = read_lines(typed_file("soak-" + k))
@@ -540,7 +590,9 @@ def main():
     p.add_argument("--lab", default=L)
     p.add_argument("--only", default="startup,echo,integrity,typing,outage,udpblock,ctrlc,idle,revoke,soak")
     p.add_argument("--soak", type=float, default=10)
+    p.add_argument("--kinds", default="ssh,qsh", help="clients for the tests that compare them")
     a = p.parse_args()
+    KINDS[:] = a.kinds.split(",")
     L = a.lab
     SSH = ["ssh", "-p", "2222", "-i", f"{L}/key", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
     for f in os.listdir(L):
@@ -557,6 +609,7 @@ def main():
         "udpblock": t_udpblock,
         "ctrlc": t_ctrlc,
         "idle": t_idle,
+        "flow": t_flow,
         "revoke": t_revoke,
         "soak": lambda: t_soak(a.soak),
     }

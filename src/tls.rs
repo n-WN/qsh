@@ -58,17 +58,87 @@ pub fn transport() -> quinn::TransportConfig {
     t.send_window(16 << 20);
     t.max_concurrent_bidi_streams(256u32.into());
     t.initial_rtt(Duration::from_millis(150));
-    // QSH_CC=bbr|cubic|newreno (for measurements).
+    // BBR: it measures the bottleneck rate and the round trip, so it does
+    // not fill the queues of the path. A terminal needs this: a Ctrl-C or a
+    // key waits behind every byte in a queue. Loss-based controllers (Cubic)
+    // also slow down on each random loss. In tests/netlab, BBR moved output
+    // 4-7 times faster on lossy links, and Ctrl-C on a 1 Mbit/s link with a
+    // 2 s queue took 0.7 s instead of 3.7 s. QSH_CC=cubic|newreno for
+    // measurements.
     match std::env::var("QSH_CC").as_deref() {
-        Ok("bbr") => {
-            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        Ok("cubic") => t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        Ok("newreno") => t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+        _ => {
+            // quinn starts BBR with 240 KB in flight: 2 s in the queue of a
+            // 1 Mbit/s link before BBR knows the rate. Start as RFC 9002 says.
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(14720);
+            t.congestion_controller_factory(Arc::new(Floored(Arc::new(bbr))))
         }
-        Ok("newreno") => {
-            t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
-        }
-        _ => {}
-    }
+    };
     t
+}
+
+/// The smallest congestion window (16 packets, 19 KB: 0.15 s at 1 Mbit/s).
+/// On an idle connection, BBR estimates the rate from the liveness pings
+/// alone, and its window falls to 4 packets. Pings and keys count against
+/// the window, so 4 lost pings would block both until loss detection: seconds
+/// on a bad link, and a false "no reply" badge.
+const WINDOW_FLOOR: u64 = 16 * 1200;
+
+struct Floored(Arc<quinn::congestion::BbrConfig>);
+
+impl quinn::congestion::ControllerFactory for Floored {
+    fn build(self: Arc<Self>, now: std::time::Instant, mtu: u16) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(Floor(self.0.clone().build(now, mtu)))
+    }
+}
+
+/// A congestion controller with a window of at least `WINDOW_FLOOR`.
+struct Floor(Box<dyn quinn::congestion::Controller>);
+
+impl quinn::congestion::Controller for Floor {
+    fn on_sent(&mut self, now: std::time::Instant, bytes: u64, last_packet_number: u64) {
+        self.0.on_sent(now, bytes, last_packet_number)
+    }
+
+    fn on_ack(&mut self, now: std::time::Instant, sent: std::time::Instant, bytes: u64, app_limited: bool, rtt: &quinn_proto::RttEstimator) {
+        self.0.on_ack(now, sent, bytes, app_limited, rtt)
+    }
+
+    fn on_end_acks(&mut self, now: std::time::Instant, in_flight: u64, app_limited: bool, largest_packet_num_acked: Option<u64>) {
+        self.0.on_end_acks(now, in_flight, app_limited, largest_packet_num_acked)
+    }
+
+    fn on_congestion_event(&mut self, now: std::time::Instant, sent: std::time::Instant, is_persistent_congestion: bool, lost_bytes: u64) {
+        self.0.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes)
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.0.on_mtu_update(new_mtu)
+    }
+
+    fn window(&self) -> u64 {
+        self.0.window().max(WINDOW_FLOOR)
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        let mut m = self.0.metrics();
+        m.congestion_window = self.window();
+        m
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(Floor(self.0.clone_box()))
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.0.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
 }
 
 pub fn server_config(id: &Identity) -> Result<quinn::ServerConfig> {

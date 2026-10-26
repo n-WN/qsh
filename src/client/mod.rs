@@ -342,7 +342,24 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
             && Build::parse(&k.build).is_some_and(|b| !opts.install || !Build::current().replaces(&b))
     });
     let Some(k) = known else { return connect_ssh(opts, spec, hello, t0).await };
-    let fast = connect_fast(opts, spec, &k, hello, t0);
+    // One attempt can fail on a lossy link that works (QUIC's retransmission
+    // timers back off), so the direct path tries again with a new connection,
+    // until the daemon refuses the token or 60 s have passed. Not for a start
+    // that makes a session: the first attempt may have made it.
+    let again = !hello.new && hello.command.is_empty();
+    let fast = async {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match connect_fast(opts, spec, &k, hello, t0).await {
+                Ok(a) => return Ok(a),
+                Err(Fail::Retry(e)) if again && Instant::now() < deadline => {
+                    crate::paths::log(format!("fast start: {e:#}; again"));
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(f) => return Err(fail_error(f)),
+            }
+        }
+    };
     tokio::pin!(fast);
     // When the direct path is slow (another network, UDP blocked), SSH starts
     // too. The wait allows one lost handshake packet (sent again after 3-4 RTT).
@@ -350,29 +367,41 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
     tokio::select! {
         r = &mut fast => match r {
             Ok(a) => return Ok(a),
-            Err(e) => crate::paths::log(format!("fast start failed: {e:#}")),
-        },
-        _ = tokio::time::sleep(wait) => {
-            crate::paths::log("fast start is slow: SSH starts too");
-            let ssh = connect_ssh(opts, spec, hello, t0);
-            tokio::pin!(ssh);
-            tokio::select! {
-                r = &mut fast => match r {
-                    Ok(a) => return Ok(a),
-                    Err(e) => crate::paths::log(format!("fast start failed: {e:#}")),
-                },
-                r = &mut ssh => return r,
+            Err(e) => {
+                crate::paths::log(format!("fast start failed: {e:#}"));
+                return connect_ssh(opts, spec, hello, t0).await;
             }
-            return ssh.await;
-        }
+        },
+        _ = tokio::time::sleep(wait) => {}
     }
-    connect_ssh(opts, spec, hello, t0).await
+    crate::paths::log("fast start is slow: SSH starts too");
+    let ssh = connect_ssh(opts, spec, hello, t0);
+    tokio::pin!(ssh);
+    // The first that works wins. When one fails, the other goes on.
+    tokio::select! {
+        r = &mut fast => match r {
+            Ok(a) => Ok(a),
+            Err(e) => {
+                crate::paths::log(format!("fast start failed: {e:#}"));
+                ssh.await
+            }
+        },
+        r = &mut ssh => match r {
+            Ok(a) => Ok(a),
+            Err(e) => {
+                crate::paths::log(format!("SSH failed: {e:#}; the direct path goes on"));
+                fast.await.map_err(|f| e.context(format!("direct connection: {f:#}")))
+            }
+        },
+    }
 }
 
-async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hello, t0: Instant) -> Result<Attached> {
-    let link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone()))?;
+/// One attempt of a fast start. `Fail::Retry`: the attempt failed, another
+/// one can work.
+async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hello, t0: Instant) -> std::result::Result<Attached, Fail> {
+    let link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone())).map_err(Fail::Fatal)?;
     let rtt = Duration::from_millis(k.rtt_ms * 5 / 4).clamp(Duration::from_millis(25), Duration::from_millis(300));
-    let conn = link.connect_rtt(rtt, Duration::from_secs(3)).await?;
+    let conn = link.connect_rtt(rtt, Duration::from_secs(3)).await.map_err(Fail::Retry)?;
     let mut h = hello.clone();
     h.token = k.token.clone();
     h.server_addr = k.addr.to_string();
@@ -381,9 +410,9 @@ async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hel
         Err(Fail::Fatal(e)) if e.to_string().contains("token") => {
             // The daemon does not know the token (revoked, expired, new daemon).
             known::forget(spec);
-            return Err(e);
+            return Err(Fail::Fatal(e));
         }
-        Err(f) => return Err(fail_error(f)),
+        Err(f) => return Err(f),
     };
     crate::paths::log(format!("startup: attached without SSH {:?}", t0.elapsed()));
     if opts.verbose {

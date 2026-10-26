@@ -893,8 +893,11 @@ enum Next {
 
 /// Flow window for one connection: about two congestion windows, so the
 /// network stays busy, but little output waits in buffers.
+/// Output that may wait unacknowledged: two congestion windows. The minimum
+/// is small, because everything in it goes before a Ctrl-C takes effect:
+/// 32 KB is 0.26 s on a 1 Mbit/s link (256 KB was 2 s).
 fn window(conn: &quinn::Connection) -> u64 {
-    (2 * conn.stats().path.cwnd).clamp(256 << 10, 4 << 20)
+    (2 * conn.stats().path.cwnd).clamp(32 << 10, 4 << 20)
 }
 
 fn size_frame(s: (u16, u16, bool)) -> Vec<u8> {

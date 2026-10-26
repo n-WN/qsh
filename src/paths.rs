@@ -79,3 +79,15 @@ pub fn log(msg: impl AsRef<str>) {
             let _ = writeln!(f, "{}.{:03} [{}] {}", t.as_secs(), t.subsec_millis(), std::process::id(), msg.as_ref());
         }
 }
+
+/// Debug dump of raw bytes: set QSH_DUMP to a file path. Session output goes
+/// there, input that goes to the server into the same path with ".in".
+pub fn dump(input: bool, data: &[u8]) {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(p) = PATH.get_or_init(|| std::env::var_os("QSH_DUMP").map(PathBuf::from)) else { return };
+    let p = if input { p.with_extension("in") } else { p.clone() };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = f.write_all(data);
+    }
+}

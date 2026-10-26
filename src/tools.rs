@@ -135,6 +135,26 @@ pub async fn share(readonly: bool, ttl: u64) -> Result<()> {
     Ok(())
 }
 
+/// List (or revoke) the devices that can connect without SSH.
+pub async fn devices(revoke: Option<String>) -> Result<()> {
+    let revoke = revoke.map(|r| if r == "all" { String::new() } else { r });
+    let rep = local(LocalReq::Devices { revoke: revoke.clone() }).await?;
+    if revoke.is_some() {
+        println!("removed {} device(s)", rep.removed);
+    }
+    if rep.devices.is_empty() {
+        println!("no devices");
+        return Ok(());
+    }
+    let now = paths::now_secs();
+    println!("{:<14} {:<24} {:>10} {:>10}", "ID", "CLIENT", "CREATED", "LAST USE");
+    for d in &rep.devices {
+        let days = |t: u64| format!("{}d ago", now.saturating_sub(t) / 86400);
+        println!("{:<14} {:<24} {:>10} {:>10}", d.id, d.label, days(d.created), days(d.last_used));
+    }
+    Ok(())
+}
+
 pub fn print_sessions(sessions: &[proto::SessionInfo]) {
     if sessions.is_empty() {
         println!("no sessions");

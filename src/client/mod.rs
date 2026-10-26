@@ -4,6 +4,7 @@
 pub mod clipboard;
 pub mod drop;
 pub mod install;
+pub mod known;
 pub mod net;
 pub mod predict;
 pub mod rpc;
@@ -45,6 +46,8 @@ pub struct Opts {
     pub predict: Predict,
     /// Install or upgrade qsh on the server when needed.
     pub install: bool,
+    /// Connect to known hosts without SSH (device tokens).
+    pub fast: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +130,11 @@ enum Fail {
     /// The server forgot this client (for example, after a long time away).
     Unknown,
 }
+
+/// Liveness pings (QUIC datagrams that the server echoes). They are not
+/// sent again when lost: with 4 per second, a path with some loss does not
+/// look dead (a gap of 2.5 s needs about 10 losses in a row).
+const PING_EVERY: Duration = Duration::from_millis(250);
 
 /// A connection, its terminal stream, and input to send first (again).
 type Streams = (quinn::Connection, quinn::SendStream, quinn::RecvStream, Vec<u8>);
@@ -296,41 +304,165 @@ async fn bootstrap(opts: &Opts, spec: &SshSpec) -> Result<net::Helper> {
     }
 }
 
+/// A connection with an attached terminal stream.
+struct Attached {
+    link: Link,
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    welcome: Welcome,
+}
+
+fn fail_error(f: Fail) -> anyhow::Error {
+    match f {
+        Fail::Retry(e) | Fail::Fatal(e) => e,
+        Fail::Unknown => anyhow!("unknown client"),
+    }
+}
+
+/// Connect and attach: directly with a device token when the host is known
+/// (fast start, no SSH), else (or when that does not work) over SSH.
+async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
+    let Some(spec) = &opts.ssh else {
+        let Some((addr, fp, token)) = &opts.direct else { bail!("no destination") };
+        let link = Link::new(*addr, fp, Transport::Udp, None)?;
+        let conn = link.connect(Duration::from_secs(8)).await.map_err(|e| anyhow!("cannot reach {addr}: {e:#}"))?;
+        let mut h = hello.clone();
+        h.token = token.clone();
+        h.server_addr = addr.to_string();
+        let (send, recv, welcome) = handshake(&conn, &h).await.map_err(fail_error)?;
+        return Ok(Attached { link, conn, send, recv, welcome });
+    };
+    // A known host whose daemon is not older than this client: no SSH. (An
+    // older daemon needs the SSH path, which installs the new build.)
+    let known = known::load(spec).filter(|k| {
+        opts.fast
+            && opts.transport != Transport::Ssh
+            && Build::parse(&k.build).is_some_and(|b| !opts.install || !Build::current().replaces(&b))
+    });
+    let Some(k) = known else { return connect_ssh(opts, spec, hello, t0).await };
+    let fast = connect_fast(opts, spec, &k, hello, t0);
+    tokio::pin!(fast);
+    // When the direct path is slow (another network, UDP blocked), SSH starts too.
+    let wait = if k.tunnel { Duration::ZERO } else { Duration::from_millis((k.rtt_ms * 6).clamp(400, 1500)) };
+    tokio::select! {
+        r = &mut fast => match r {
+            Ok(a) => return Ok(a),
+            Err(e) => crate::paths::log(format!("fast start failed: {e:#}")),
+        },
+        _ = tokio::time::sleep(wait) => {
+            crate::paths::log("fast start is slow: SSH starts too");
+            let ssh = connect_ssh(opts, spec, hello, t0);
+            tokio::pin!(ssh);
+            tokio::select! {
+                r = &mut fast => match r {
+                    Ok(a) => return Ok(a),
+                    Err(e) => crate::paths::log(format!("fast start failed: {e:#}")),
+                },
+                r = &mut ssh => return r,
+            }
+            return ssh.await;
+        }
+    }
+    connect_ssh(opts, spec, hello, t0).await
+}
+
+async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hello, t0: Instant) -> Result<Attached> {
+    let link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone()))?;
+    let conn = link.connect(Duration::from_secs(3)).await?;
+    let mut h = hello.clone();
+    h.token = k.token.clone();
+    h.server_addr = k.addr.to_string();
+    let (send, recv, welcome) = match handshake(&conn, &h).await {
+        Ok(x) => x,
+        Err(Fail::Fatal(e)) if e.to_string().contains("token") => {
+            // The daemon does not know the token (revoked, expired, new daemon).
+            known::forget(spec);
+            return Err(e);
+        }
+        Err(f) => return Err(fail_error(f)),
+    };
+    crate::paths::log(format!("startup: attached without SSH {:?}", t0.elapsed()));
+    if opts.verbose {
+        eprintln!("qsh: {} (no SSH)", link.path_name());
+    }
+    let mut k = k.clone();
+    k.rtt_ms = conn.rtt().as_millis() as u64;
+    k.build = welcome.build.clone();
+    k.tunnel = false;
+    known::save(spec, &k);
+    Ok(Attached { link, conn, send, recv, welcome })
+}
+
+/// Bootstrap over SSH: the helper gives the port, the certificate fingerprint
+/// and a one-time token. Then QUIC over UDP and QUIC through the same SSH
+/// connection race.
+async fn connect_ssh(opts: &Opts, spec: &SshSpec, hello: &Hello, t0: Instant) -> Result<Attached> {
+    let want_tunnel = opts.transport != Transport::Udp;
+    let helper = bootstrap(opts, spec).await?;
+    crate::paths::log(format!("startup: helper answered {:?}", t0.elapsed()));
+    let addr = net::resolve(spec, helper.line.port).await?;
+    let fp = helper.line.fp.clone();
+    let token = helper.line.token.clone().ok_or_else(|| anyhow!("no token from the server"))?;
+    let mut link = Link::new(addr, &fp, opts.transport, Some(spec.clone()))?;
+    let cand = net::race(link.race_spec(), want_tunnel.then_some(helper), Duration::ZERO).await?;
+    let conn = link.adopt(cand);
+    crate::paths::log(format!("startup: QUIC connected ({:?}) {:?}", link.kind, t0.elapsed()));
+    if link.kind == PathKind::Tunnel && opts.transport == Transport::Auto {
+        eprintln!("qsh: no UDP path to {addr}; QUIC goes through the SSH connection (qsh moves to UDP when it works)");
+    } else if opts.verbose {
+        eprintln!("qsh: {}", link.path_name());
+    }
+    let mut h = hello.clone();
+    h.token = token;
+    h.server_addr = addr.to_string();
+    let (send, recv, welcome) = handshake(&conn, &h).await.map_err(fail_error)?;
+    // Remember the host for a fast start next time. A token for the same
+    // daemon (same certificate) stays, also at a new address; else a new device.
+    if opts.fast && !welcome.readonly && !welcome.build.is_empty() {
+        let tunnel = link.kind == PathKind::Tunnel;
+        let rtt_ms = conn.rtt().as_millis() as u64;
+        let (build, old) = (welcome.build.clone(), known::load(spec).filter(|k| k.fp == fp));
+        match old {
+            Some(k) => known::save(spec, &known::Known { addr, build, rtt_ms, tunnel, ..k }),
+            None => {
+                let (conn2, spec2) = (conn.clone(), spec.clone());
+                tokio::spawn(async move {
+                    match rpc_device(&conn2).await {
+                        Ok(token) => known::save(&spec2, &known::Known { addr, fp, token, build, rtt_ms, tunnel }),
+                        Err(e) => crate::paths::log(format!("no device token: {e:#}")),
+                    }
+                });
+            }
+        }
+    }
+    Ok(Attached { link, conn, send, recv, welcome })
+}
+
+async fn rpc_device(conn: &quinn::Connection) -> Result<String> {
+    let label = nix::unistd::gethostname().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+    let (mut s, mut r) = conn.open_bi().await?;
+    proto::write_msg(&mut s, &proto::Rpc::Device { label }).await?;
+    let _ = s.finish();
+    let rep: proto::Reply = tokio::time::timeout(Duration::from_secs(10), proto::read_msg(&mut r)).await??;
+    match rep.token {
+        Some(t) if rep.ok => Ok(t),
+        _ => bail!("{}", rep.error.unwrap_or_default()),
+    }
+}
+
 pub async fn run(opts: Opts) -> Result<i32> {
     if !term::is_tty() {
         bail!("qsh needs a terminal on stdin and stdout");
     }
     let size = term::size();
+    let t0 = Instant::now();
     let (term_name, terminfo, env) = term_env();
-
-    // Bootstrap: SSH gives the port, the certificate fingerprint and a one-time
-    // token. Then QUIC over UDP and QUIC through the same SSH connection race.
-    let (mut link, token, conn) = if let Some(spec) = &opts.ssh {
-        let want_tunnel = opts.transport != Transport::Udp;
-        let helper = bootstrap(&opts, spec).await?;
-        let addr = net::resolve(spec, helper.line.port).await?;
-        let fp = helper.line.fp.clone();
-        let token = helper.line.token.clone().ok_or_else(|| anyhow!("no token from the server"))?;
-        let mut link = Link::new(addr, &fp, opts.transport, Some(spec.clone()))?;
-        let cand = net::race(link.race_spec(), want_tunnel.then_some(helper), Duration::ZERO).await?;
-        let conn = link.adopt(cand);
-        if link.kind == PathKind::Tunnel && opts.transport == Transport::Auto {
-            eprintln!("qsh: no UDP path to {addr}; QUIC goes through the SSH connection (qsh moves to UDP when it works)");
-        } else if opts.verbose {
-            eprintln!("qsh: {}", link.path_name());
-        }
-        (link, token, conn)
-    } else if let Some((addr, fp, token)) = &opts.direct {
-        let link = Link::new(*addr, fp, Transport::Udp, None)?;
-        let conn = link.connect(Duration::from_secs(8)).await.map_err(|e| anyhow!("cannot reach {addr}: {e:#}"))?;
-        (link, token.clone(), conn)
-    } else {
-        bail!("no destination");
-    };
+    crate::paths::log(format!("startup: terminal info {:?}", t0.elapsed()));
 
     let mut hello = Hello {
         version: proto::VERSION,
-        token,
+        token: String::new(),
         session: opts.session.clone(),
         client_id: None,
         offset: 0,
@@ -342,16 +474,13 @@ pub async fn run(opts: Opts) -> Result<i32> {
         terminfo,
         env,
         command: opts.command.clone(),
-        server_addr: link.addr.to_string(),
+        server_addr: String::new(),
         new: opts.new_session,
         // The screen is made blank below, before any session output.
         clean: true,
     };
-    let (send, recv, w) = match handshake(&conn, &hello).await {
-        Ok(x) => x,
-        Err(Fail::Retry(e)) | Err(Fail::Fatal(e)) => bail!("{e:#}"),
-        Err(Fail::Unknown) => bail!("unknown client"),
-    };
+    let Attached { mut link, conn, send, recv, welcome: w } = connect(&opts, &hello, t0).await?;
+    crate::paths::log(format!("startup: attached {:?}", t0.elapsed()));
     hello.client_id = Some(w.client_id);
     hello.token = w.resume_token.clone();
     hello.session = w.session.clone();
@@ -470,6 +599,7 @@ async fn send_input(sh: &Shared, send: &mut quinn::SendStream, b: &[u8]) -> bool
     }
     let end = sh.input.lock().unwrap().push(b);
     let _ = sh.out.try_send(Out::Typed { data: b.to_vec(), end });
+    crate::paths::dump(true, b);
     send.write_all(&proto::frame(kind::INPUT, b)).await.is_ok()
 }
 
@@ -524,8 +654,12 @@ async fn drive(
     let le = last_echo.clone();
     let c4 = conn.clone();
     let echo = tokio::spawn(async move {
-        while c4.read_datagram().await.is_ok() {
-            *le.lock().unwrap() = Instant::now();
+        while let Ok(d) = c4.read_datagram().await {
+            let gap = std::mem::replace(&mut *le.lock().unwrap(), Instant::now()).elapsed();
+            if gap > Duration::from_millis(1500) {
+                let seq = d.get(1..5).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
+                crate::paths::log(format!("echo gap {gap:?} (echo of ping {seq}, rtt {:?})", c4.rtt()));
+            }
         }
     });
     let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<bool>();
@@ -533,7 +667,7 @@ async fn drive(
     let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Result<Vec<String>>>();
     let mut upload: Option<Upload> = None;
 
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(PING_EVERY);
     let mut last_ping = Instant::now() - Duration::from_secs(10);
     let mut seq: u32 = 0;
     let mut rebound = false;
@@ -541,6 +675,7 @@ async fn drive(
     let mut last_probe = Instant::now() - Duration::from_secs(25);
     let mut probing = false;
     let mut predict_sent = (false, u128::MAX);
+    let mut last_tick = Instant::now();
 
     let outcome = loop {
         tokio::select! {
@@ -605,7 +740,12 @@ async fn drive(
                             _ => break Outcome::Detached("detached".into()),
                         }
                     }
-                    Event::Quit => break Outcome::Quit,
+                    Event::Quit => {
+                        // The session stays; this client does not come back.
+                        let _ = send.write_all(&proto::control_frame(&Control::Detach)).await;
+                        let _ = tokio::time::timeout(Duration::from_millis(500), reader.net_rx.recv()).await;
+                        break Outcome::Quit;
+                    }
                     Event::Help => ui.panel(HELP.iter().map(|l| (l.to_string(), false)).collect(), 15, true),
                     Event::Key('i') => ui.panel(info_lines(&conn, link, hello), 15, true),
                     Event::Key(k) => {
@@ -746,14 +886,22 @@ async fn drive(
                 }
             }
             _ = tick.tick() => {
+                let late = last_tick.elapsed();
+                last_tick = Instant::now();
+                if late > Duration::from_millis(1000) {
+                    crate::paths::log(format!("tick late: {late:?}"));
+                }
                 ui.tick();
                 let _ = sh.out.try_send(Out::Tick);
-                if last_ping.elapsed() >= Duration::from_millis(1000) {
+                // The tick period is PING_EVERY (small timer jitter is allowed).
+                if last_ping.elapsed() >= PING_EVERY.mul_f32(0.8) {
                     last_ping = Instant::now();
                     seq = seq.wrapping_add(1);
                     let mut d = vec![b'P'];
                     d.extend_from_slice(&seq.to_be_bytes());
-                    let _ = conn.send_datagram(d.into());
+                    if let Err(e) = conn.send_datagram(d.into()) {
+                        crate::paths::log(format!("ping {seq} not sent: {e}"));
+                    }
                 }
                 if let Some(u) = &upload {
                     let done = u.done.load(Ordering::Relaxed).min(u.total);
@@ -948,6 +1096,7 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::Unbounde
                     continue;
                 }
                 let skip = cur.saturating_sub(off) as usize;
+                crate::paths::dump(false, &data[skip..]);
                 if sh.out.send(Out::Data(data[skip..].to_vec())).await.is_err() {
                     return Outcome::Quit;
                 }

@@ -15,6 +15,7 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 | Files without scp | Drop files into the terminal: they go to the server and the remote paths are pasted. `qsh send` / `qsh get` in the session, `qsh cp` on your machine, all on the open connection |
 | Multiplexer | Sessions live on the server. Detach, reattach from another device, many sessions per client, live sharing. Clients with different window sizes: the one that types sets the size, the others show a view |
 | Install and upgrade | The client installs itself on the server. A new version takes over the running daemon: sessions and clients stay |
+| Startup | A known host gets no SSH login: one QUIC handshake, and the prompt shows in 0.25–0.3 s (ssh: 1.3–2 s) |
 
 ## How it works
 
@@ -30,7 +31,8 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
    necessary and prints the UDP port, the SHA-256 of the daemon certificate, a
    one-time token, and its build. SSH does the authentication, as with mosh. If
    the server has no qsh, or an older one, the client installs its own build
-   first (see [Install and upgrades](#install-and-upgrades)).
+   first (see [Install and upgrades](#install-and-upgrades)). A known host
+   needs no SSH (see [Fast start](#fast-start)).
 2. The client connects with QUIC and pins the certificate. QUIC over UDP and
    QUIC through the same SSH process (a datagram pipe) start at the same time.
    The first that works wins; UDP gets 150 ms more when the tunnel is first.
@@ -39,6 +41,26 @@ fixes the usual problems of `ssh`, `mosh` and `tmux`:
 4. On a new connection the client sends its offset; the server replays the
    missing bytes from the ring buffer. If the bytes are gone (or the client is
    new), the server sends a snapshot from its mirror of the screen instead.
+
+### Fast start
+
+After a login over SSH, the client gets a device token from the daemon. It
+keeps the token, the address, the certificate fingerprint and the daemon's
+build in `~/.qsh/known/` (mode 0600). The next `qsh host` connects with QUIC
+and the token directly: no SSH, so the prompt shows after the QUIC handshake
+and one round trip.
+
+- If the direct connection has not worked after 6 RTT (0.4–1.5 s), the SSH
+  login starts too, and the first that works wins. If the last login went
+  through the SSH tunnel (no UDP path), SSH starts at once.
+- If the daemon rejects the token, the client deletes it and logs in over
+  SSH.
+- The token belongs to the daemon (its certificate): a login over SSH to the
+  same daemon keeps it, also when the address changed.
+- When this client is a newer build than the daemon, it logs in over SSH,
+  because that path installs the new build.
+- `--transport ssh` and `--no-fast` always log in over SSH. For the security
+  trade-off, see [Security](#security).
 
 ### Snapshots
 
@@ -61,7 +83,9 @@ program (vim, htop) also gets a SIGWINCH, so it redraws itself at once.
 
 ### Roaming and liveness
 
-- Every second the client sends a QUIC datagram; the server echoes it. After
+- Four times a second the client sends a QUIC datagram; the server echoes it.
+  Lost pings are not sent again, so the rate matters: on a path with 4 % loss,
+  one ping a second gave a false alarm every few minutes. After
   3 s without an echo the client moves to a new UDP socket (new NAT mapping,
   new interface), and at the same time races a new connection (UDP and the SSH
   tunnel). The first path that works continues the session at its offset. No
@@ -124,10 +148,15 @@ during the view go into its scrollback.
 The server keeps unacknowledged output per connection to about two congestion
 windows (minimum 256 KB). It stops reading the pty while the active client is
 more than 1 MB behind, so the program blocks on write as with ssh and no
-output is lost. Ctrl-C during a flood returns in about 0.5 s at 75 ms RTT,
-because little output is in flight and the kernel discards the pty queue on
-SIGINT. A disconnected client never stops the session; a client that lags far
-behind gets a snapshot.
+output is lost. A disconnected client never stops the session; a client that
+lags far behind gets a snapshot.
+
+Ctrl-C during a flood: when the server reads an interrupt key from a client
+(byte `0x03`, or Ctrl-C in the kitty keyboard encoding), it waits 40 ms for
+the program to stop. If that client is then more than 128 KB behind, it gets
+the screen (a snapshot) instead of the rest of the output. The prompt comes
+back in about 0.3 s at 70 ms RTT (ssh: 1.5 s). The skipped lines are not in
+the local scrollback; the screen is correct.
 
 ## Install
 
@@ -189,7 +218,8 @@ Options that limit what the server can do on your machine: `--no-clipboard`,
 `--no-receive`, `--no-open`, `--no-osc52`, `--read-paths ask|always|never`
 (see [Security](#security)). `--no-drop` pastes dropped files as local paths.
 `--predict auto|always|never` controls [local echo](#local-echo);
-`--no-install` keeps the server's qsh as it is.
+`--no-install` keeps the server's qsh as it is; `--no-fast` always logs in
+over SSH (see [Fast start](#fast-start)).
 
 Keys (the prefix is `Ctrl-^`, as in mosh):
 
@@ -293,6 +323,14 @@ another). It does not log in again. It was faster than scp in a test
 - Only owner connections (from SSH) can open or make other sessions. A share
   link gives access to one session, optionally read-only.
 - The local unix sockets are in `~/.qsh` (mode 0700).
+- Fast start keeps a device token in `~/.qsh/known/` on your machine. It
+  works like an SSH key without a passphrase: a person who has that file can
+  open a shell on the server without SSH, also after you remove your key
+  from `authorized_keys`. The server keeps only the SHA-256 of each token. A
+  token that is not used for 30 days stops working. Only a login over SSH
+  can make a device token, so a stolen token cannot make more tokens. On the
+  server, `qsh devices` lists the devices, and `qsh devices --revoke ID` (or
+  `all`) removes them. `--no-fast` turns fast start off for a client.
 - The server can use your local clipboard, send files to your download folder
   and open http(s) links. Disable with `--no-clipboard`, `--no-receive`,
   `--no-open`. Reads of local files by path need your consent in a dialog
@@ -346,7 +384,7 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
   new size; after `:q` the main screen and its history are there.
 - Drop of a 300 kB file into `md5sum `: same MD5 on the server. `Ctrl-C`
   during a 60 MB drop: the upload stops, the partial folder is removed.
-- Ctrl-C during an output flood: the prompt comes back in about 0.5 s.
+- Ctrl-C during an output flood: the prompt comes back in about 0.3 s.
 - Session switch with `Ctrl-^ c` / `Ctrl-^ p`: each session shows only its own
   scrollback. When a session's shell exits, the client moves to another one.
 - A read-write share link: the guest can type, but `Ctrl-^ c` makes no session.
@@ -365,6 +403,39 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
 - A server without qsh: installed from the local cache in 2.5 s, prompt after
   7 s. A server with an older qsh and no binary for its platform here: built
   on the server, then the running daemon took over the new build.
+- Fast start with the stored address on a closed port (as when UDP is
+  blocked): SSH started after 6 RTT, prompt after 1.8–2.2 s; the token stayed
+  and no new device was made. A revoked token: prompt after 1.7 s over SSH,
+  and a new token.
+- Quit a session and attach again within 2 s: a new session starts (the
+  ended one is not used). A client whose connection closes stops holding the
+  pty size at once.
+
+### Benchmark against ssh
+
+`tests/bench/bench.py` runs ssh and qsh in a pty, as a terminal does (it
+reads all output and answers cursor position queries). It measures the time
+to the prompt, key echo, output throughput, and Ctrl-C during a flood:
+
+```sh
+tests/bench/bench.py user@host --qsh target/release/qsh --ssh "ssh -i ~/.ssh/key" --port P
+```
+
+Results from a macOS client to a Linux server, at 55–90 ms RTT with about
+4 % packet loss on the path:
+
+| Test | ssh | qsh |
+|---|---|---|
+| Startup to prompt (median of 8) | 1303 ms | 310 ms (fast start) |
+| Key echo (median of 20) | 76 ms | 0 ms (local echo); 51 ms with `--predict never` |
+| `seq 1 2000000` (16.9 MB) | 29.6 s, 0.6 MB/s | 8.3 s, 2.0 MB/s |
+| Ctrl-C in a flood, until the next command ran (1 run) | 1532 ms | 314 ms |
+
+On this path, `ssh host cat file` moved 0.8 MB/s: the limit of ssh is its
+TCP connection, not the terminal. A daemon with `QSH_CC=bbr` was not faster
+than the default (Cubic). The network changes from run to run (the ssh
+startup median was 2064 ms in another run), so compare clients in the same
+run.
 
 ## Source layout
 
@@ -381,18 +452,24 @@ Manual end-to-end checks that were done against a Linux server (75 ms RTT):
 | `src/server/session.rs` | pty session, ring buffer, backpressure, pty mode |
 | `src/server/helper.rs` | `qsh helper` (SSH bootstrap and datagram relay) |
 | `src/server/pty.rs` | pty and child process |
+| `src/server/devices.rs` | device tokens for fast start |
 | `src/client/mod.rs` | connect, liveness, reconnect, input log, session switch, overlay state |
 | `src/client/net.rs` | SSH helper process, SSH tunnel socket, path race, path changes |
 | `src/client/install.rs` | install and upgrade qsh on the server |
+| `src/client/known.rs` | known hosts for fast start |
 | `src/client/term.rs` | raw mode, keys, paste |
 | `src/client/screen.rs` | output thread: overlay, predictions, view mode, VT scanner |
 | `src/client/predict.rs` | local echo prediction |
 | `src/client/drop.rs` | drag and drop: path detection, upload, paste rewrite |
 | `src/client/rpc.rs` | requests from the server, `qsh cp` |
 | `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |
+| `tests/bench/bench.py` | benchmark against ssh |
 
 ## Debug
 
-`QSH_LOG=/tmp/qsh.log` writes connection events; `QSH_TRACE=quinn=debug`
-adds quinn tracing. `kill -USR1` / `kill -USR2` on the client moves the
-connection to a new UDP socket / to the SSH tunnel.
+`QSH_LOG=/tmp/qsh.log` writes connection events and startup times;
+`QSH_TRACE=quinn=debug` adds quinn tracing. `QSH_DUMP=/tmp/qsh.out` writes
+the raw session output that the client gets (and the input that it sends, to
+`/tmp/qsh.out.in`). `QSH_CC=bbr|newreno` changes the congestion controller of
+the process (default Cubic); the daemon sends the output. `kill -USR1` / `kill -USR2` on the client moves
+the connection to a new UDP socket / to the SSH tunnel.

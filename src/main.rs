@@ -86,6 +86,10 @@ struct ConnectArgs {
     /// Do not install or upgrade qsh on the server.
     #[arg(long)]
     no_install: bool,
+    /// Always log in over SSH: do not connect to known hosts directly, and do
+    /// not remember this host.
+    #[arg(long)]
+    no_fast: bool,
     /// Tell which network path the connection uses.
     #[arg(short, long)]
     verbose: bool,
@@ -183,6 +187,12 @@ enum Cmd {
     },
     /// Print the version and build of this program.
     Version,
+    /// (On the server) list the client machines that connect without SSH;
+    /// --revoke ID (or all) removes them.
+    Devices {
+        #[arg(long, value_name = "ID|all")]
+        revoke: Option<String>,
+    },
     #[command(hide = true)]
     Helper {
         #[arg(long)]
@@ -273,6 +283,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Some(Cmd::Daemon { port, idle_exit, resume_from, .. }) => {
             rt.block_on(server::daemon::run(port, Duration::from_secs(idle_exit), resume_from)).map(|_| 0)
         }
+        Some(Cmd::Devices { revoke }) => rt.block_on(tools::devices(revoke)).map(|_| 0),
         Some(Cmd::Version) => {
             println!("qsh {} build {} {}", version::describe(), version::Build::current(), version::platform());
             Ok(0)
@@ -375,6 +386,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     PredictArg::Never => client::Predict::Never,
                 },
                 install: !c.no_install,
+                fast: !c.no_fast,
             };
             if dest.starts_with("qsh://") {
                 let (addr, fp, token, session) = parse_link(&dest)?;

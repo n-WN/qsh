@@ -159,6 +159,9 @@ pub struct Welcome {
     /// servers.
     #[serde(default)]
     pub input_seen: Option<u64>,
+    /// The daemon's build ("ID:TIME").
+    #[serde(default)]
+    pub build: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -198,6 +201,9 @@ pub enum Rpc {
     /// Client to server: this stream becomes a terminal stream for another
     /// session (a session switch on the same connection).
     Attach { hello: Hello },
+    /// Client to server (owner connections only): a device token, to connect
+    /// later without SSH. `label` names the client machine.
+    Device { label: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -213,6 +219,8 @@ pub struct Reply {
     pub saved: Vec<String>,
     #[serde(default)]
     pub sessions: Vec<SessionInfo>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 impl Reply {
@@ -236,6 +244,9 @@ pub enum LocalReq {
     Share { session: String, readonly: bool, ttl: u64 },
     /// Replace the daemon process with `exe`; sessions and clients stay.
     Upgrade { exe: String },
+    /// List device tokens; with `revoke`, remove those whose id starts with
+    /// it ("" removes all).
+    Devices { revoke: Option<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -256,6 +267,18 @@ pub struct LocalReply {
     /// The daemon's build ("ID:TIME").
     #[serde(default)]
     pub build: String,
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+    #[serde(default)]
+    pub removed: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub label: String,
+    pub created: u64,
+    pub last_used: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

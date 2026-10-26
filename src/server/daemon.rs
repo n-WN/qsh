@@ -39,6 +39,11 @@ pub const STATE_VERSION: u32 = 1;
 
 /// A client further behind than this gets a screen snapshot instead of the backlog.
 const LAG_LIMIT: u64 = 4 << 20;
+/// After an interrupt, a backlog larger than this is replaced by the screen.
+const SKIP_MIN: u64 = 128 << 10;
+/// Time for the program to stop after an interrupt (the kernel then also
+/// drops the pty's output queue).
+const SKIP_WAIT: Duration = Duration::from_millis(40);
 const CHUNK: usize = 64 * 1024;
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(120);
 const STALE_CLIENT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -63,6 +68,7 @@ pub struct Daemon {
     lock_fd: RawFd,
     /// An upgrade is in progress: new connections wait for the new program.
     upgrading: AtomicBool,
+    devices: Mutex<super::devices::Devices>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     grants: Mutex<HashMap<String, GrantEntry>>,
     next_id: AtomicU64,
@@ -82,6 +88,10 @@ struct ConnCtx {
     /// Set after a successful read-write attach: later streams of this
     /// connection can attach to (or make) other sessions without a token.
     trusted: AtomicBool,
+    /// Set when the connection logged in with a one-time token from the SSH
+    /// helper. Only such a connection can register a device: a device token
+    /// cannot make more device tokens.
+    ssh_login: AtomicBool,
     /// The session that the client shows now (for `qsh cp` paths).
     current: Mutex<Option<Arc<Session>>>,
 }
@@ -91,6 +101,8 @@ struct Attached {
     id: u64,
     epoch: u64,
     owner: bool,
+    /// Logged in with a one-time token from the SSH helper.
+    ssh_login: bool,
     start: Start,
     welcome: Welcome,
 }
@@ -153,6 +165,7 @@ pub async fn run(port: Option<u16>, idle_exit: Duration, resume: Option<PathBuf>
         unix_fd,
         lock_fd,
         upgrading: AtomicBool::new(false),
+        devices: Mutex::new(super::devices::Devices::load()),
         sessions: Mutex::new(HashMap::new()),
         grants: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
@@ -318,7 +331,7 @@ impl Daemon {
         let conn = inc.await?;
         self.conns.fetch_add(1, Ordering::SeqCst);
         let _guard = ConnGuard(self.clone());
-        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), current: Mutex::new(None) });
+        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), ssh_login: AtomicBool::new(false), current: Mutex::new(None) });
         let (send, mut recv) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
         let hello: Hello = tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??;
 
@@ -363,7 +376,29 @@ impl Daemon {
         if att.owner {
             ctx.trusted.store(true, Ordering::SeqCst);
         }
+        if att.ssh_login {
+            ctx.ssh_login.store(true, Ordering::SeqCst);
+        }
         *ctx.current.lock().unwrap() = Some(att.session.clone());
+        // However this connection ends, the client is then gone (not a ghost
+        // that looks connected and can hold the pty size).
+        {
+            let (sess, conn, id, epoch) = (att.session.clone(), ctx.conn.clone(), att.id, att.epoch);
+            tokio::spawn(async move {
+                conn.closed().await;
+                let mut st = sess.st.lock().unwrap();
+                if let Some(slot) = st.clients.get_mut(&id)
+                    && slot.epoch == epoch
+                    && slot.conn.is_some()
+                {
+                    slot.conn = None;
+                    slot.ctl = None;
+                    slot.gone_since = Some(Instant::now());
+                }
+                drop(st);
+                sess.cv.notify_all();
+            });
+        }
         if proto::write_msg(&mut send, &att.welcome).await.is_err() {
             return;
         }
@@ -406,6 +441,14 @@ impl Daemon {
             Rpc::List => {
                 proto::write_msg(&mut s, &Reply { ok: true, sessions: self.list(), ..Default::default() }).await?;
             }
+            Rpc::Device { label } => {
+                let rep = if ctx.ssh_login.load(Ordering::SeqCst) {
+                    Reply { ok: true, token: Some(self.devices.lock().unwrap().add(&label)), ..Default::default() }
+                } else {
+                    Reply::err("only a login over SSH can register a device")
+                };
+                proto::write_msg(&mut s, &rep).await?;
+            }
             Rpc::Push { dest, .. } => {
                 let target = resolve(&cwd, &dest);
                 // "dir/": a new folder (drag and drop). It goes away if the transfer fails.
@@ -444,6 +487,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .values()
+            .filter(|s| s.exit.borrow().is_none())
             .map(|s| {
                 let st = s.st.lock().unwrap();
                 SessionInfo {
@@ -506,6 +550,7 @@ impl Daemon {
                 id,
                 epoch,
                 owner,
+                ssh_login: false,
                 start: Start::Offset(h.offset),
                 welcome: Welcome {
                     ok: true,
@@ -515,24 +560,31 @@ impl Daemon {
                     resumed: true,
                     readonly,
                     input_seen: Some(input_seen),
+                    build: Build::current().to_string(),
                     ..Default::default()
                 },
             });
         }
 
+        let mut ssh_login = false;
         let grant = if h.token.is_empty() && trusted {
             Grant::Bootstrap
         } else {
             let mut g = self.grants.lock().unwrap();
             g.retain(|_, e| e.expires > Instant::now());
             let found = g.iter().find(|(k, _)| ct_eq(k, &h.token)).map(|(k, _)| k.clone());
-            let Some(key) = found else { bail!("invalid or expired token") };
-            match &g[&key].grant {
-                Grant::Bootstrap => {
-                    g.remove(&key);
-                    Grant::Bootstrap
-                }
-                Grant::Share { session, readonly } => Grant::Share { session: session.clone(), readonly: *readonly },
+            match found {
+                // A device token from an earlier login (fast start).
+                None if self.devices.lock().unwrap().check(&h.token) => Grant::Bootstrap,
+                None => bail!("invalid or expired token"),
+                Some(key) => match &g[&key].grant {
+                    Grant::Bootstrap => {
+                        g.remove(&key);
+                        ssh_login = true;
+                        Grant::Bootstrap
+                    }
+                    Grant::Share { session, readonly } => Grant::Share { session: session.clone(), readonly: *readonly },
+                },
             }
         };
         let owner = matches!(grant, Grant::Bootstrap);
@@ -552,7 +604,9 @@ impl Daemon {
             } else {
                 name
             };
-            match ss.get(&name) {
+            // A session whose program ended stays for 2 s, for the clients that
+            // were in it (they get the exit code). A new client gets a new one.
+            match ss.get(&name).filter(|s| s.exit.borrow().is_none()) {
                 Some(s) => (s.clone(), false, name),
                 None => {
                     if !may_create {
@@ -587,6 +641,7 @@ impl Daemon {
                 ack_at: Instant::now(),
                 input_seen: 0,
                 echo: None,
+                skip_at: None,
             },
         );
         let before = st.size;
@@ -605,6 +660,7 @@ impl Daemon {
             id,
             epoch: 1,
             owner,
+            ssh_login,
             start: if created {
                 Start::Offset(0)
             } else {
@@ -618,6 +674,7 @@ impl Daemon {
                 created,
                 readonly,
                 input_seen: Some(0),
+                build: Build::current().to_string(),
                 ..Default::default()
             },
         })
@@ -691,6 +748,19 @@ impl Daemon {
                     ..Default::default()
                 };
                 proto::write_msg(&mut w, &rep).await?;
+            }
+            LocalReq::Devices { revoke } => {
+                let (devices, removed) = {
+                    let mut d = self.devices.lock().unwrap();
+                    let removed = revoke.map_or(0, |p| d.revoke(&p));
+                    let devices = d
+                        .list()
+                        .into_iter()
+                        .map(|x| proto::DeviceInfo { id: x.hash[..12].to_string(), label: x.label, created: x.created, last_used: x.last_used })
+                        .collect();
+                    (devices, removed)
+                };
+                proto::write_msg(&mut w, &LocalReply { ok: true, devices, removed, ..Default::default() }).await?;
             }
             LocalReq::Upgrade { exe } => {
                 // Replies only on failure: on success, this process runs the new program.
@@ -810,15 +880,22 @@ async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch
         let win = window(&conn);
         let next = {
             let mut st = sess.st.lock().unwrap();
-            let (acked, echo) = match st.clients.get(&id) {
-                Some(c) if c.epoch == epoch => (c.acked, c.echo),
+            let (acked, echo, skip_at) = match st.clients.get(&id) {
+                Some(c) if c.epoch == epoch => (c.acked, c.echo, c.skip_at),
                 _ => return,
             };
             let head = st.ring.head();
             let size = (st.size[0], st.size[1], st.active == Some(id));
             let mut out = Vec::new();
+            // After an interrupt, do not make the user wait for output that the
+            // program wrote before it stopped: show the screen as it is now.
+            let skip = skip_at.is_some_and(|t| Instant::now() >= t);
+            if skip && let Some(c) = st.clients.get_mut(&id) {
+                c.skip_at = None;
+            }
             let snapshot = match snap.take() {
                 Some(s) => Some(s),
+                None if skip && head.saturating_sub(off) > SKIP_MIN => Some((None, Prep::Scroll)),
                 None if off < st.ring.base() || off > head || head - off > LAG_LIMIT => Some((None, Prep::Scroll)),
                 None => None,
             };
@@ -909,6 +986,9 @@ async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::
                     }
                     slot.input_seen += p.len() as u64;
                     let count = slot.input_seen;
+                    if !slot.readonly && session::has_interrupt(&p) {
+                        slot.skip_at = Some(Instant::now() + SKIP_WAIT);
+                    }
                     let ok = if slot.readonly {
                         false
                     } else if st.active != Some(id) {
@@ -1210,6 +1290,7 @@ impl Daemon {
                             ack_at: now,
                             input_seen: c.input_seen,
                             echo: None,
+                            skip_at: None,
                         },
                     )
                 })

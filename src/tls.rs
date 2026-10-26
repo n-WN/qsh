@@ -58,6 +58,16 @@ pub fn transport() -> quinn::TransportConfig {
     t.send_window(16 << 20);
     t.max_concurrent_bidi_streams(256u32.into());
     t.initial_rtt(Duration::from_millis(150));
+    // QSH_CC=bbr|cubic|newreno (for measurements).
+    match std::env::var("QSH_CC").as_deref() {
+        Ok("bbr") => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        Ok("newreno") => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+        }
+        _ => {}
+    }
     t
 }
 

@@ -109,6 +109,9 @@ pub struct ClientSlot {
     /// An input acknowledgement to send: (input count, ring head). It goes
     /// out after the output up to that head, so it follows the echo.
     pub echo: Option<(u64, u64)>,
+    /// The user interrupted (Ctrl-C): output that waits for this client is
+    /// not wanted. From this time on, the client gets the screen instead.
+    pub skip_at: Option<Instant>,
 }
 
 pub struct State {
@@ -410,6 +413,12 @@ impl State {
     }
 }
 
+/// True if the input has an interrupt key: Ctrl-C as a byte, or in the kitty
+/// keyboard protocol.
+pub fn has_interrupt(d: &[u8]) -> bool {
+    d.contains(&0x03) || [&b"\x1b[99;5u"[..], b"\x1b[99;5:1u"].iter().any(|k| d.windows(k.len()).any(|w| w == *k))
+}
+
 /// True if the input looks like a terminal's reply to a query (not a key press).
 /// Replies from clients that are not active are dropped, so that two attached
 /// terminals do not both answer.
@@ -458,5 +467,8 @@ mod tests {
         assert!(!looks_like_report(b"\x1b[A"));
         assert!(!looks_like_report(b"a"));
         assert!(!looks_like_report(b"\x1b[97;5u"));
+        assert!(has_interrupt(b"ab\x03"));
+        assert!(has_interrupt(b"\x1b[99;5u"));
+        assert!(!has_interrupt(b"\x1b[99u"));
     }
 }

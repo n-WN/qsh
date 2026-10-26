@@ -163,11 +163,16 @@ async fn relay(port: u16, mut out: tokio::io::Stdout) -> Result<()> {
     let up = async move {
         let mut inp = tokio::io::stdin();
         let mut buf = vec![0u8; 65536];
+        // The input ends when the client closes the tunnel: a normal end.
         loop {
             let mut l = [0u8; 2];
-            inp.read_exact(&mut l).await?;
+            if inp.read_exact(&mut l).await.is_err() {
+                return Ok(());
+            }
             let n = u16::from_be_bytes(l) as usize;
-            inp.read_exact(&mut buf[..n]).await?;
+            if inp.read_exact(&mut buf[..n]).await.is_err() {
+                return Ok(());
+            }
             let _ = u2.send(&buf[..n]).await;
         }
         #[allow(unreachable_code)]
@@ -181,8 +186,10 @@ async fn relay(port: u16, mut out: tokio::io::Stdout) -> Result<()> {
             f.clear();
             f.extend_from_slice(&(n as u16).to_be_bytes());
             f.extend_from_slice(&buf[..n]);
-            out.write_all(&f).await?;
-            out.flush().await?;
+            // The client is gone.
+            if out.write_all(&f).await.is_err() || out.flush().await.is_err() {
+                return Ok(());
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())

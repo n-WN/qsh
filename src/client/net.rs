@@ -67,17 +67,22 @@ impl std::error::Error for Missing {}
 
 /// A running `ssh host qsh helper` process.
 pub struct Helper {
-    child: Child,
+    _child: SshChild,
     pub line: ConnectLine,
     to_ssh: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     from_ssh: Option<mpsc::Receiver<Vec<u8>>>,
     alive: Arc<AtomicBool>,
 }
 
-impl Drop for Helper {
+/// An ssh process that stops when this value goes away: also when the start
+/// is cancelled before the helper answered (fast start won the race). A
+/// `Child` alone keeps running.
+struct SshChild(Child);
+
+impl Drop for SshChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -105,14 +110,34 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
     }
     cmd.args(["-T", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]);
     cmd.arg(&spec.dest).arg(spec.remote_command(&args));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-    cmd.stderr(if background { Stdio::null() } else { Stdio::inherit() });
-    let mut child = cmd.spawn().with_context(|| format!("start {}", spec.argv[0]))?;
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = SshChild(cmd.spawn().with_context(|| format!("start {}", spec.argv[0]))?);
+    let stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
     let alive = Arc::new(AtomicBool::new(true));
 
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<Result<String>>();
+    // Messages of ssh (and of the server's shell) go to the terminal only
+    // while the user waits for the login. Later they would write into the
+    // session's screen, or after qsh has exited; they go to the log.
+    let answered = Arc::new(AtomicBool::new(background));
+    let last_err = Arc::new(Mutex::new(String::new()));
+    {
+        let (answered, last_err) = (answered.clone(), last_err.clone());
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if answered.load(Ordering::SeqCst) {
+                    crate::paths::log(format!("ssh: {line}"));
+                } else {
+                    eprintln!("{line}");
+                }
+                *last_err.lock().unwrap() = line;
+            }
+        });
+    }
+
+    let (line_tx, line_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let (pkt_tx, pkt_rx) = mpsc::channel::<Vec<u8>>(4096);
     let a = alive.clone();
     std::thread::spawn(move || {
@@ -123,14 +148,14 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
             match r.read_line(&mut line) {
                 Ok(0) | Err(_) => {
                     a.store(false, Ordering::SeqCst);
-                    let _ = line_tx.send(Err(anyhow!("ssh exited before the qsh server answered")));
+                    let _ = line_tx.send(None);
                     return;
                 }
                 Ok(_) => {}
             }
             // Shell startup files can print text first; skip it.
             if line.starts_with("QSH-CONNECT ") || line.starts_with("QSH-MISSING ") {
-                let _ = line_tx.send(Ok(line.trim().to_string()));
+                let _ = line_tx.send(Some(line.trim().to_string()));
                 break;
             }
         }
@@ -178,10 +203,17 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
         (None, None)
     };
 
-    let timeout = if background { 20 } else { 120 };
-    let line = tokio::task::spawn_blocking(move || line_rx.recv_timeout(Duration::from_secs(timeout)))
-        .await?
-        .map_err(|_| anyhow!("no answer from the qsh server over ssh"))??;
+    // Cancel safe: if this future is dropped, `child` stops ssh.
+    let timeout = Duration::from_secs(if background { 20 } else { 120 });
+    let line = match tokio::time::timeout(timeout, line_rx).await {
+        Ok(Ok(Some(line))) => line,
+        Ok(_) => {
+            let e = last_err.lock().unwrap().clone();
+            bail!("ssh exited before the qsh server answered{}", if background && !e.is_empty() { format!(": {e}") } else { String::new() })
+        }
+        Err(_) => bail!("no answer from the qsh server over ssh"),
+    };
+    answered.store(true, Ordering::SeqCst);
     let f: Vec<&str> = line.split_whitespace().collect();
     if f[0] == "QSH-MISSING" && f.len() >= 3 {
         return Err(Missing(crate::version::platform_of_uname(f[1], f[2])).into());
@@ -196,7 +228,7 @@ pub async fn spawn_helper(spec: &SshSpec, tunnel: bool, token: bool, background:
         build: f.get(5).and_then(|b| crate::version::Build::parse(b)),
         platform: f.get(6).map(|p| p.to_string()),
     };
-    Ok(Helper { child, line, to_ssh, from_ssh, alive })
+    Ok(Helper { _child: child, line, to_ssh, from_ssh, alive })
 }
 
 /// Find the address of the host, as ssh would (`ssh -G` applies the ssh config).
@@ -306,6 +338,8 @@ pub struct Link {
     pub spec: Option<SshSpec>,
     fp: String,
     tunnel: Option<Helper>,
+    /// The last round-trip time of the session (for new handshakes).
+    pub rtt: Duration,
 }
 
 /// What a path race needs.
@@ -315,6 +349,7 @@ pub struct RaceSpec {
     pub fp: String,
     pub transport: Transport,
     pub spec: Option<SshSpec>,
+    pub rtt: Duration,
 }
 
 /// The winner of a path race: a connection with its endpoint.
@@ -323,6 +358,17 @@ pub struct Candidate {
     pub conn: quinn::Connection,
     pub kind: PathKind,
     helper: Option<Helper>,
+}
+
+/// A client config for a handshake when the round-trip time is known: a
+/// lost handshake packet is sent again after about 3 RTT (the default
+/// assumes 150 ms, about 0.5 s).
+fn client_config_rtt(fp: &str, rtt: Duration) -> Result<quinn::ClientConfig> {
+    let mut cfg = crate::tls::client_config(fp)?;
+    let mut t = crate::tls::transport();
+    t.initial_rtt(rtt.clamp(Duration::from_millis(25), Duration::from_millis(300)));
+    cfg.transport_config(Arc::new(t));
+    Ok(cfg)
 }
 
 fn udp_endpoint(addr: &SocketAddr, fp: &str) -> Result<quinn::Endpoint> {
@@ -400,6 +446,71 @@ pub async fn race(rs: RaceSpec, helper: Option<Helper>, tunnel_delay: Duration) 
     }
 }
 
+/// Like `race`, for a reconnect: it does not give up. A fresh UDP handshake
+/// (new socket, last round-trip time) starts every second, and up to three
+/// overlap, so the session continues soon after the network comes back. SSH
+/// tunnel attempts run at the same time, one after the other.
+pub async fn race_until_up(rs: RaceSpec) -> Candidate {
+    let direct = async {
+        let mut tries = tokio::task::JoinSet::new();
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = every.tick(), if tries.len() < 3 => {
+                    let (addr, fp, rtt) = (rs.addr, rs.fp.clone(), rs.rtt);
+                    tries.spawn(async move {
+                        let ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(&addr)?, Arc::new(quinn::TokioRuntime))?;
+                        let c = ep.connect_with(client_config_rtt(&fp, rtt)?, addr, "qsh")?;
+                        let conn = tokio::time::timeout(Duration::from_secs(3), c).await.map_err(|_| anyhow!("timeout"))??;
+                        Ok::<_, anyhow::Error>((ep, conn))
+                    });
+                }
+                Some(r) = tries.join_next() => {
+                    if let Ok(Ok((ep, conn))) = r {
+                        return Candidate { ep, conn, kind: PathKind::Direct, helper: None };
+                    }
+                }
+            }
+        }
+    };
+    let tunnel = async {
+        let Some(spec) = rs.spec.clone() else { return std::future::pending().await };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        loop {
+            let r = async {
+                let mut h = spawn_helper(&spec, true, false, true).await?;
+                let ep = tunnel_endpoint(&mut h, &rs.addr, &rs.fp)?;
+                let (ep, conn) = handshake_on(ep, rs.addr, Duration::from_secs(10)).await?;
+                Ok::<_, anyhow::Error>(Candidate { ep, conn, kind: PathKind::Tunnel, helper: Some(h) })
+            };
+            match r.await {
+                Ok(c) => return c,
+                Err(e) => {
+                    crate::paths::log(format!("reconnect over SSH: {e:#}"));
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    };
+    match rs.transport {
+        Transport::Udp => direct.await,
+        Transport::Ssh => tunnel.await,
+        Transport::Auto => {
+            tokio::pin!(direct, tunnel);
+            tokio::select! {
+                c = &mut direct => c,
+                c = &mut tunnel => {
+                    // UDP is better: give it a moment to win.
+                    match tokio::time::timeout(Duration::from_millis(150), &mut direct).await {
+                        Ok(d) => d,
+                        Err(_) => c,
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn bind_any(addr: &SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     std::net::UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
 }
@@ -407,7 +518,7 @@ fn bind_any(addr: &SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 impl Link {
     pub fn new(addr: SocketAddr, fp: &str, transport: Transport, spec: Option<SshSpec>) -> Result<Link> {
         let ep = udp_endpoint(&addr, fp)?;
-        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, fp: fp.to_string(), tunnel: None })
+        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, fp: fp.to_string(), tunnel: None, rtt: Duration::from_millis(150) })
     }
 
     /// Use the connection of a race winner (and its endpoint and tunnel).
@@ -419,7 +530,7 @@ impl Link {
     }
 
     pub fn race_spec(&self) -> RaceSpec {
-        RaceSpec { addr: self.addr, fp: self.fp.clone(), transport: self.transport, spec: self.spec.clone() }
+        RaceSpec { addr: self.addr, fp: self.fp.clone(), transport: self.transport, spec: self.spec.clone(), rtt: self.rtt }
     }
 
     pub fn path_name(&self) -> String {
@@ -451,6 +562,13 @@ impl Link {
 
     pub async fn connect(&self, timeout: Duration) -> Result<quinn::Connection> {
         let c = self.ep.connect(self.addr, "qsh")?;
+        Ok(tokio::time::timeout(timeout, c).await.map_err(|_| anyhow!("timeout"))??)
+    }
+
+    /// Connect when the round-trip time is known: a lost handshake packet is
+    /// sent again after about 3 RTT (the default assumes 150 ms, about 0.5 s).
+    pub async fn connect_rtt(&self, rtt: Duration, timeout: Duration) -> Result<quinn::Connection> {
+        let c = self.ep.connect_with(client_config_rtt(&self.fp, rtt)?, self.addr, "qsh")?;
         Ok(tokio::time::timeout(timeout, c).await.map_err(|_| anyhow!("timeout"))??)
     }
 

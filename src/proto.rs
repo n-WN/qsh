@@ -169,8 +169,13 @@ pub struct Welcome {
 pub enum Control {
     /// client -> server: forget this client and close.
     Detach,
-    /// server -> client: the session ended.
-    Exit { code: i32 },
+    /// server -> client: the session ended. `others`: the sessions that the
+    /// client can move to (for owners; None from older servers).
+    Exit {
+        code: i32,
+        #[serde(default)]
+        others: Option<Vec<String>>,
+    },
     /// server -> client: this client was detached.
     Detached { reason: String },
     /// server -> client: show a short message.

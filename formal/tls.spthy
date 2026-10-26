@@ -1,0 +1,84 @@
+/*
+ * qsh, level 1: the connection (QUIC with TLS 1.3, no 0-RTT).
+ *
+ * The client gets the daemon's public key over SSH and pins it. The
+ * handshake is a signed Diffie-Hellman exchange: the daemon signs both key
+ * shares with its long-term key. The attacker controls the network and can
+ * steal the daemon's key at any time.
+ *
+ * The lemmas show what formal/qsh.spthy assumes about a connection of an
+ * honest client: it ends at the real daemon, and its key stays secret unless
+ * the daemon key was stolen before the connection was made (forward secrecy).
+ */
+
+theory qsh_tls
+begin
+
+builtins: diffie-hellman, signing, symmetric-encryption, hashing
+
+rule Daemon_Start:
+    [ Fr(~ltk) ]
+  --[ DaemonStart($D) ]->
+    [ !Ltk($D, ~ltk), !Pk($D, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Compromise_Daemon_Key:
+    [ !Ltk($D, ltk) ]
+  --[ CompromiseDaemon($D) ]->
+    [ Out(ltk) ]
+
+/* The client knows the daemon's key from SSH (pinning). */
+rule C_Hello:
+    [ !Pk($D, pkD), Fr(~x) ]
+  --[ ClientStart($C, $D, 'g'^~x) ]->
+    [ Out('g'^~x), CWait($C, $D, pkD, ~x) ]
+
+rule S_Reply:
+    [ In(X), Fr(~y), !Ltk($D, ltk) ]
+  --[ ServerKey($D, h(X^~y)) ]->
+    [ Out(<'g'^~y, sign(<X, 'g'^~y>, ltk)>), SConn($D, h(X^~y)) ]
+
+/* Only after the signature check does the client send data (no 0-RTT). */
+rule C_Done:
+    [ CWait($C, $D, pkD, ~x), In(<Y, sig>), Fr(~m) ]
+  --[ Eq(verify(sig, <'g'^~x, Y>, pkD), true), ClientKey($C, $D, h(Y^~x)), Sent($C, $D, ~m, h(Y^~x)) ]->
+    [ Out(senc(~m, h(Y^~x))) ]
+
+/* The daemon receives data on its side of the connection. */
+rule S_Receive:
+    [ SConn($D, k), In(senc(m, k)) ]
+  --[ Received($D, m, k) ]->
+    [ ]
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction OneKeyPerDaemon:
+  "All D #i #j. DaemonStart(D) @ #i & DaemonStart(D) @ #j ==> #i = #j"
+
+lemma exec_connection: exists-trace
+  "Ex C D m k #i #j. Sent(C, D, m, k) @ #i & Received(D, m, k) @ #j
+     & not (Ex #r. CompromiseDaemon(D) @ #r)"
+
+/* The client's connection ends at the daemon whose key it pinned. */
+lemma pinned_daemon:
+  "All C D k #i. ClientKey(C, D, k) @ #i ==>
+     (Ex #j. ServerKey(D, k) @ #j & #j < #i) | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+/* The key of the connection is secret, unless the daemon key was stolen
+ * before the connection (a later theft does not help: forward secrecy). */
+lemma key_secret:
+  "All C D k #i. ClientKey(C, D, k) @ #i ==>
+     not (Ex #j. K(k) @ #j) | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+/* Data that the client sends is secret, with the same condition. */
+lemma data_secret:
+  "All C D m k #i. Sent(C, D, m, k) @ #i ==>
+     not (Ex #j. K(m) @ #j) | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+/* Data that the daemon receives on the client's connection comes from the
+ * client, with the same condition. */
+lemma data_authentic:
+  "All C D m k #i #j. ClientKey(C, D, k) @ #i & Received(D, m, k) @ #j ==>
+     (Ex #s. Sent(C, D, m, k) @ #s & #s < #j) | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+end

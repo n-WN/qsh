@@ -278,6 +278,14 @@ fn main() {
 
 fn real_main(cli: Cli) -> Result<i32> {
     let rt = runtime();
+    let r = run_cmd(&rt, cli);
+    // The result is known: do not wait for blocking work that still runs (a
+    // file dialog, a read of a helper that is not needed).
+    rt.shutdown_timeout(Duration::from_millis(200));
+    r
+}
+
+fn run_cmd(rt: &tokio::runtime::Runtime, cli: Cli) -> Result<i32> {
     match cli.cmd {
         Some(Cmd::Daemon { check_upgrade: Some(v), .. }) => Ok(if v == server::daemon::STATE_VERSION { 0 } else { 1 }),
         Some(Cmd::Daemon { port, idle_exit, resume_from, .. }) => {

@@ -93,6 +93,10 @@ pub struct ClientSlot {
     /// Attached with the owner's SSH bootstrap token (not a share link). Only
     /// owners can open or make other sessions on the same connection.
     pub owner: bool,
+    /// The device (hash of its token) that this client logged in with, also
+    /// for clients made later on the same connection. When the device is
+    /// revoked, these clients end.
+    pub device: Option<String>,
     pub resume_token: String,
     pub conn: Option<quinn::Connection>,
     /// Writer channel of the current connection (for control frames).

@@ -34,6 +34,8 @@ use crate::{
 const ECHO_WAIT: Duration = Duration::from_millis(50);
 /// QUIC close code: the daemon restarts with a new program; connect again now.
 pub const CLOSE_UPGRADE: u32 = 2;
+/// Close code: the device of this client was revoked.
+pub const CLOSE_REVOKED: u32 = 3;
 /// Format of the state that a daemon gives to its successor.
 pub const STATE_VERSION: u32 = 1;
 
@@ -92,6 +94,8 @@ struct ConnCtx {
     /// helper. Only such a connection can register a device: a device token
     /// cannot make more device tokens.
     ssh_login: AtomicBool,
+    /// The device token (its hash) that this connection logged in with.
+    device: Mutex<Option<String>>,
     /// The session that the client shows now (for `qsh cp` paths).
     current: Mutex<Option<Arc<Session>>>,
 }
@@ -103,6 +107,7 @@ struct Attached {
     owner: bool,
     /// Logged in with a one-time token from the SSH helper.
     ssh_login: bool,
+    device: Option<String>,
     start: Start,
     welcome: Welcome,
 }
@@ -331,7 +336,7 @@ impl Daemon {
         let conn = inc.await?;
         self.conns.fetch_add(1, Ordering::SeqCst);
         let _guard = ConnGuard(self.clone());
-        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), ssh_login: AtomicBool::new(false), current: Mutex::new(None) });
+        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), ssh_login: AtomicBool::new(false), device: Mutex::new(None), current: Mutex::new(None) });
         let (send, mut recv) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
         let hello: Hello = tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??;
 
@@ -364,7 +369,8 @@ impl Daemon {
     /// Run one terminal stream: attach, then send output and take input.
     async fn terminal(self: &Arc<Self>, ctx: &Arc<ConnCtx>, mut send: quinn::SendStream, mut recv: quinn::RecvStream, hello: Hello) {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
-        let att = match self.attach(&ctx.conn, &hello, ctx.trusted.load(Ordering::SeqCst), tx.clone()) {
+        let conn_device = ctx.device.lock().unwrap().clone();
+        let att = match self.attach(&ctx.conn, &hello, ctx.trusted.load(Ordering::SeqCst), conn_device, tx.clone()) {
             Ok(a) => a,
             Err(e) => {
                 let w = Welcome { ok: false, error: Some(format!("{e:#}")), ..Default::default() };
@@ -378,6 +384,9 @@ impl Daemon {
         }
         if att.ssh_login {
             ctx.ssh_login.store(true, Ordering::SeqCst);
+        }
+        if att.device.is_some() {
+            *ctx.device.lock().unwrap() = att.device.clone();
         }
         *ctx.current.lock().unwrap() = Some(att.session.clone());
         // However this connection ends, the client is then gone (not a ghost
@@ -412,7 +421,7 @@ impl Daemon {
             let _ = send.finish();
         });
 
-        let out = tokio::spawn(output_loop(att.session.clone(), ctx.conn.clone(), att.id, att.epoch, tx.clone(), att.start));
+        let out = tokio::spawn(output_loop(self.clone(), att.session.clone(), ctx.conn.clone(), att.id, att.epoch, tx.clone(), att.start));
         let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx).await;
         {
             let mut st = att.session.st.lock().unwrap();
@@ -506,7 +515,36 @@ impl Daemon {
         sessions
     }
 
-    fn attach(self: &Arc<Self>, conn: &quinn::Connection, h: &Hello, trusted: bool, ctl: mpsc::Sender<Vec<u8>>) -> Result<Attached> {
+    /// End the clients of revoked devices: their slots go (so their resume
+    /// tokens stop working), and their connections close (so no new stream
+    /// can use the trust of the connection). A client of the real user then
+    /// logs in again over SSH.
+    fn end_device_clients(&self, gone: &[String]) {
+        if gone.is_empty() {
+            return;
+        }
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for s in sessions {
+            let mut st = s.st.lock().unwrap();
+            let ids: Vec<u64> = st.clients.iter().filter(|(_, c)| c.device.as_ref().is_some_and(|d| gone.contains(d))).map(|(id, _)| *id).collect();
+            for id in ids {
+                if let Some(c) = s.remove_client(&mut st, id)
+                    && let Some(conn) = c.conn
+                {
+                    conn.close(CLOSE_REVOKED.into(), b"device revoked");
+                }
+            }
+        }
+    }
+
+    fn attach(
+        self: &Arc<Self>,
+        conn: &quinn::Connection,
+        h: &Hello,
+        trusted: bool,
+        conn_device: Option<String>,
+        ctl: mpsc::Sender<Vec<u8>>,
+    ) -> Result<Attached> {
         if h.version != proto::VERSION {
             bail!("protocol version mismatch (client {}, server {})", h.version, proto::VERSION);
         }
@@ -540,6 +578,7 @@ impl Daemon {
             }
             let readonly = slot.readonly;
             let owner = slot.owner;
+            let device = slot.device.clone();
             let token = slot.resume_token.clone();
             if st.active == Some(id) {
                 sess.resize(&mut st, [h.cols, h.rows, h.xpix, h.ypix]);
@@ -551,6 +590,7 @@ impl Daemon {
                 epoch,
                 owner,
                 ssh_login: false,
+                device,
                 start: Start::Offset(h.offset),
                 welcome: Welcome {
                     ok: true,
@@ -567,7 +607,9 @@ impl Daemon {
         }
 
         let mut ssh_login = false;
+        let mut device = None;
         let grant = if h.token.is_empty() && trusted {
+            device = conn_device;
             Grant::Bootstrap
         } else {
             let mut g = self.grants.lock().unwrap();
@@ -575,8 +617,13 @@ impl Daemon {
             let found = g.iter().find(|(k, _)| ct_eq(k, &h.token)).map(|(k, _)| k.clone());
             match found {
                 // A device token from an earlier login (fast start).
-                None if self.devices.lock().unwrap().check(&h.token) => Grant::Bootstrap,
-                None => bail!("invalid or expired token"),
+                None => match self.devices.lock().unwrap().check(&h.token) {
+                    Some(hash) => {
+                        device = Some(hash);
+                        Grant::Bootstrap
+                    }
+                    None => bail!("invalid or expired token"),
+                },
                 Some(key) => match &g[&key].grant {
                     Grant::Bootstrap => {
                         g.remove(&key);
@@ -631,6 +678,7 @@ impl Daemon {
                 size: [h.cols, h.rows, h.xpix, h.ypix],
                 readonly,
                 owner,
+                device: device.clone(),
                 resume_token: token.clone(),
                 conn: Some(conn.clone()),
                 ctl: Some(ctl),
@@ -661,6 +709,7 @@ impl Daemon {
             epoch: 1,
             owner,
             ssh_login,
+            device,
             start: if created {
                 Start::Offset(0)
             } else {
@@ -750,17 +799,18 @@ impl Daemon {
                 proto::write_msg(&mut w, &rep).await?;
             }
             LocalReq::Devices { revoke } => {
-                let (devices, removed) = {
+                let (devices, gone) = {
                     let mut d = self.devices.lock().unwrap();
-                    let removed = revoke.map_or(0, |p| d.revoke(&p));
+                    let gone = revoke.map_or_else(Vec::new, |p| d.revoke(&p));
                     let devices = d
                         .list()
                         .into_iter()
                         .map(|x| proto::DeviceInfo { id: x.hash[..12].to_string(), label: x.label, created: x.created, last_used: x.last_used })
                         .collect();
-                    (devices, removed)
+                    (devices, gone)
                 };
-                proto::write_msg(&mut w, &LocalReply { ok: true, devices, removed, ..Default::default() }).await?;
+                self.end_device_clients(&gone);
+                proto::write_msg(&mut w, &LocalReply { ok: true, devices, removed: gone.len(), ..Default::default() }).await?;
             }
             LocalReq::Upgrade { exe } => {
                 // Replies only on failure: on success, this process runs the new program.
@@ -861,7 +911,7 @@ fn input_ack_frame(n: u64, mode: u8) -> Vec<u8> {
     proto::frame(kind::INPUT_ACK, &p)
 }
 
-async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch: u64, tx: mpsc::Sender<Vec<u8>>, start: Start) {
+async fn output_loop(d: Arc<Daemon>, sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch: u64, tx: mpsc::Sender<Vec<u8>>, start: Start) {
     let mut head_rx = sess.head.subscribe();
     let mut ack_rx = sess.ack.subscribe();
     let mut exit_rx = sess.exit.subscribe();
@@ -957,7 +1007,10 @@ async fn output_loop(sess: Arc<Session>, conn: quinn::Connection, id: u64, epoch
                 }
             }
             Next::Exit(code) => {
-                let _ = tx.send(proto::control_frame(&Control::Exit { code })).await;
+                // With the list, the client can move to another session at once.
+                let owner = sess.st.lock().unwrap().clients.get(&id).is_some_and(|c| c.owner);
+                let others = owner.then(|| d.list().into_iter().map(|s| s.name).collect());
+                let _ = tx.send(proto::control_frame(&Control::Exit { code, others })).await;
                 return;
             }
             Next::Wait => {
@@ -1101,6 +1154,8 @@ struct SavedClient {
     size: [u16; 4],
     readonly: bool,
     owner: bool,
+    #[serde(default)]
+    device: Option<String>,
     resume_token: String,
     server_addr: String,
     acked: u64,
@@ -1205,6 +1260,7 @@ impl Daemon {
                         size: c.size,
                         readonly: c.readonly,
                         owner: c.owner,
+                        device: c.device.clone(),
                         resume_token: c.resume_token.clone(),
                         server_addr: c.server_addr.clone(),
                         acked: c.acked,
@@ -1280,6 +1336,7 @@ impl Daemon {
                             size: c.size,
                             readonly: c.readonly,
                             owner: c.owner,
+                            device: c.device,
                             resume_token: c.resume_token,
                             conn: None,
                             ctl: None,

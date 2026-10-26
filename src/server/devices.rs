@@ -38,7 +38,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 impl Devices {
     pub fn load() -> Devices {
-        let path = paths::base().join("devices.json");
+        Devices::open(paths::base().join("devices.json"))
+    }
+
+    fn open(path: PathBuf) -> Devices {
         let list: Vec<Device> = std::fs::read(&path).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let mut d = Devices { path, list };
         let now = paths::now_secs();
@@ -66,10 +69,10 @@ impl Devices {
         token
     }
 
-    /// True if the token belongs to a device that may connect.
-    pub fn check(&mut self, token: &str) -> bool {
+    /// The hash of the token, if it belongs to a device that may connect.
+    pub fn check(&mut self, token: &str) -> Option<String> {
         if token.is_empty() {
-            return false;
+            return None;
         }
         let h = hash(token);
         let now = paths::now_secs();
@@ -87,7 +90,7 @@ impl Devices {
         if dirty {
             self.save();
         }
-        found
+        found.then_some(h)
     }
 
     pub fn list(&self) -> Vec<Device> {
@@ -95,10 +98,40 @@ impl Devices {
     }
 
     /// Remove devices whose hash starts with `prefix` ("" removes all).
-    pub fn revoke(&mut self, prefix: &str) -> usize {
-        let n = self.list.len();
-        self.list.retain(|d| !d.hash.starts_with(prefix));
+    /// Returns the hashes of the removed devices.
+    pub fn revoke(&mut self, prefix: &str) -> Vec<String> {
+        let (gone, keep) = std::mem::take(&mut self.list).into_iter().partition(|d| d.hash.starts_with(prefix));
+        self.list = keep;
         self.save();
-        n - self.list.len()
+        gone.into_iter().map(|d: Device| d.hash).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_check_revoke() {
+        let dir = std::env::temp_dir().join(format!("qsh-devices-test-{}", std::process::id()));
+        let mut d = Devices::open(dir.join("devices.json"));
+        let a = d.add("laptop");
+        let b = d.add("desk\x1b[31m");
+        let ha = d.check(&a).expect("token a works");
+        assert_eq!(ha, hash(&a));
+        assert!(d.check(&b).is_some());
+        assert!(d.check("").is_none());
+        assert!(d.check(&format!("{a}x")).is_none());
+        assert!(d.list().iter().all(|x| !x.label.contains('\x1b')));
+        // Saved with mode 0600 and loaded again.
+        let d2 = Devices::open(dir.join("devices.json"));
+        assert_eq!(d2.list().len(), 2);
+        // Revoke one by prefix: its hash comes back, and it stops working.
+        assert_eq!(d.revoke(&ha[..12]), vec![ha.clone()]);
+        assert!(d.check(&a).is_none());
+        assert!(d.check(&b).is_some());
+        assert_eq!(d.revoke("").len(), 1);
+        assert!(d.check(&b).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

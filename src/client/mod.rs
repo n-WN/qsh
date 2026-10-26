@@ -116,7 +116,8 @@ pub struct Shared {
 }
 
 enum Outcome {
-    Exit(i32),
+    /// The session ended; the sessions to move to, if the server sent them.
+    Exit(i32, Option<Vec<String>>),
     Detached(String),
     Quit,
     Lost(String),
@@ -343,8 +344,9 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
     let Some(k) = known else { return connect_ssh(opts, spec, hello, t0).await };
     let fast = connect_fast(opts, spec, &k, hello, t0);
     tokio::pin!(fast);
-    // When the direct path is slow (another network, UDP blocked), SSH starts too.
-    let wait = if k.tunnel { Duration::ZERO } else { Duration::from_millis((k.rtt_ms * 6).clamp(400, 1500)) };
+    // When the direct path is slow (another network, UDP blocked), SSH starts
+    // too. The wait allows one lost handshake packet (sent again after 3-4 RTT).
+    let wait = if k.tunnel { Duration::ZERO } else { Duration::from_millis((k.rtt_ms * 8).clamp(500, 1500)) };
     tokio::select! {
         r = &mut fast => match r {
             Ok(a) => return Ok(a),
@@ -369,7 +371,8 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
 
 async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hello, t0: Instant) -> Result<Attached> {
     let link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone()))?;
-    let conn = link.connect(Duration::from_secs(3)).await?;
+    let rtt = Duration::from_millis(k.rtt_ms * 5 / 4).clamp(Duration::from_millis(25), Duration::from_millis(300));
+    let conn = link.connect_rtt(rtt, Duration::from_secs(3)).await?;
     let mut h = hello.clone();
     h.token = k.token.clone();
     h.server_addr = k.addr.to_string();
@@ -548,7 +551,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
         *sh.conn.lock().unwrap() = None;
         match o {
             Outcome::Moved(s) => streams = s,
-            Outcome::Exit(code) => break Ok((code, None)),
+            Outcome::Exit(code, _) => break Ok((code, None)),
             Outcome::Detached(r) => break Ok((0, Some(format!("[qsh: {r}; session {} stays on the server]", hello.session)))),
             Outcome::Quit => break Ok((0, Some(format!("[qsh: quit; session {} stays on the server]", hello.session)))),
             Outcome::Lost(why) => {
@@ -809,12 +812,15 @@ async fn drive(
             }
             o = reader.net_rx.recv() => {
                 let o = o.unwrap_or(Outcome::Lost("reader".into()));
-                if let Outcome::Exit(code) = o {
+                if let Outcome::Exit(code, others) = o {
                     // The shell of this session ended. Show another session, if any.
-                    let others = rpc_list(&conn).await.unwrap_or_default();
+                    let others = match others {
+                        Some(o) => o,
+                        None => rpc_list(&conn).await.unwrap_or_default().into_iter().map(|s| s.name).collect(),
+                    };
                     let ended = hello.session.clone();
-                    if let Some(next) = others.iter().find(|s| s.name != ended)
-                        && let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.name.clone())).await
+                    if let Some(next) = others.iter().find(|n| **n != ended)
+                        && let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.clone())).await
                     {
                         send = s2;
                         reader = Reader::spawn(sh, r2);
@@ -822,7 +828,7 @@ async fn drive(
                         ui.push(&sh.out);
                         continue;
                     }
-                    break Outcome::Exit(code);
+                    break Outcome::Exit(code, None);
                 }
                 break o;
             }
@@ -910,6 +916,7 @@ async fn drive(
                 }
                 let idle = last_echo.lock().unwrap().elapsed();
                 let rtt = conn.rtt();
+                link.rtt = rtt;
                 let show = match sh.predict {
                     Predict::Always => true,
                     Predict::Never => false,
@@ -944,7 +951,8 @@ async fn drive(
                 if link.tunnel_dead() {
                     break Outcome::Lost("tunnel closed".into());
                 }
-                if link.kind == PathKind::Tunnel && link.transport == Transport::Auto && !probing && last_probe.elapsed() > Duration::from_secs(30) {
+                // A probe is a QUIC handshake (a few packets): try UDP often.
+                if link.kind == PathKind::Tunnel && link.transport == Transport::Auto && !probing && last_probe.elapsed() > Duration::from_secs(10) {
                     probing = true;
                     last_probe = Instant::now();
                     let probe = ProbeTarget { addr: link.addr, fp: link.race_spec().fp };
@@ -1126,7 +1134,7 @@ async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::Unbounde
                 }
             }
             kind::CONTROL => match serde_json::from_slice::<Control>(&p) {
-                Ok(Control::Exit { code }) => return Outcome::Exit(code),
+                Ok(Control::Exit { code, others }) => return Outcome::Exit(code, others),
                 Ok(Control::Detached { reason }) => return Outcome::Detached(reason),
                 Ok(Control::Notice { text }) => crate::paths::log(format!("notice: {text}")),
                 _ => {}
@@ -1185,7 +1193,7 @@ async fn reconnect(
         }
         let rs = link.race_spec();
         let fut = async {
-            let cand = net::race(rs, None, Duration::from_millis(300)).await.map_err(Fail::Retry)?;
+            let cand = net::race_until_up(rs).await;
             let (s, r, w) = handshake(&cand.conn, &h).await?;
             Ok::<_, Fail>((cand, s, r, w))
         };

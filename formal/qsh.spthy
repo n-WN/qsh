@@ -1,0 +1,311 @@
+/*
+ * qsh, level 2: who can connect to a session, and what they can do there.
+ *
+ * A symbolic (Dolev-Yao) model for the Tamarin prover. The attacker controls
+ * the network, connects to the daemon from anywhere and sends what it wants
+ * on its own connections. It can also steal the stored device token of a
+ * client machine, read every share link (the guest is not trusted), and
+ * steal the daemon's TLS key.
+ *
+ * Connections are secure channels. formal/tls.spthy proves why: a
+ * connection of an honest client ends at the daemon that the client pinned,
+ * and its key is secret, unless the daemon key was stolen before the
+ * connection was made. So here:
+ *  - A connection is a fresh name k. Messages go in linear facts C2S/S2C:
+ *    the attacker cannot read, change or replay them.
+ *  - The attacker's own connections (Adv_Connect) and, after a theft of the
+ *    daemon key, the honest connections made after it (MITM) are open to
+ *    the attacker: it reads and writes them.
+ *
+ * Other abstractions (see formal/README.md for the mapping to the code):
+ *  - SSH is a secure channel between the user and the account. The attacker
+ *    cannot log in over SSH.
+ *  - Tokens are fresh values (256 random bits in the code).
+ *  - The daemon's tables are facts: a bootstrap token is linear (used once).
+ *    Revocation is a delete from the device table: a rule that looks a root
+ *    up records Check(D, root), and the restriction DeviceTable says that a
+ *    lookup finds a device only before it is revoked.
+ *
+ * Roots. Each connection that the daemon accepts has a root: the bootstrap
+ * token of an SSH login, the hash of a device token, or a share token. All
+ * rules that accept or serve a connection record Act(D, root, k).
+ */
+
+theory qsh
+begin
+
+builtins: hashing
+
+/* ------------------------------------------------------------------ */
+/* Connections                                                         */
+
+/* The attacker connects to the daemon and uses the connection itself. */
+rule Adv_Connect:
+    [ Fr(~k) ]
+  --[ AdvConn($D, ~k) ]->
+    [ !Open($D, ~k) ]
+
+rule Adv_Send:
+    [ !Open(D, k), In(m) ]
+  -->
+    [ C2S(D, k, m) ]
+
+rule Adv_Receive:
+    [ !Open(D, k), S2C(D, k, m) ]
+  -->
+    [ Out(m) ]
+
+/* Theft of the daemon key: from now on, the attacker can be in the middle
+ * of new connections of honest clients (see restriction ForwardSecrecy). */
+rule Compromise_Daemon_Key:
+    [ ]
+  --[ CompromiseDaemon($D) ]->
+    [ ]
+
+rule MITM:
+    [ !Honest(D, k) ]
+  --[ Mitm(D, k) ]->
+    [ !Open(D, k) ]
+
+restriction ForwardSecrecy:
+  "All D k #i. Mitm(D, k) @ #i ==>
+     Ex #c #o. CompromiseDaemon(D) @ #c & ConnOpen(D, k) @ #o & #c < #o"
+
+/* ------------------------------------------------------------------ */
+/* SSH login: `ssh host qsh helper`. The helper gives a one-time        */
+/* bootstrap token to the client, over SSH.                            */
+
+rule SSH_Login:
+    [ Fr(~bt) ]
+  --[ SshLogin($C, $D, ~bt) ]->
+    [ Grant($D, ~bt), SshReply($C, $D, ~bt) ]
+
+/* ------------------------------------------------------------------ */
+/* The honest client opens a connection with a credential: a bootstrap */
+/* token (SSH), a device token (fast start) or a resume token.         */
+
+rule C_Start_Boot:
+    [ SshReply($C, $D, ~bt), Fr(~k) ]
+  --[ ConnOpen($D, ~k) ]->
+    [ !Honest($D, ~k), C2S($D, ~k, <'hello', ~bt>), CConn($C, $D, ~k, 'boot') ]
+
+rule C_Start_Device:
+    [ !Stored($C, $D, ~dt), Fr(~k) ]
+  --[ ConnOpen($D, ~k) ]->
+    [ !Honest($D, ~k), C2S($D, ~k, <'hello', ~dt>), CConn($C, $D, ~k, 'dev') ]
+
+rule C_Start_Resume:
+    [ !CSlot($C, $D, ~rt), Fr(~k) ]
+  --[ ConnOpen($D, ~k) ]->
+    [ !Honest($D, ~k), C2S($D, ~k, <'hello', ~rt>), CConn($C, $D, ~k, 'resume') ]
+
+/* ------------------------------------------------------------------ */
+/* The daemon accepts a hello. One rule for each kind of token.       */
+
+/* A bootstrap token from SSH: used once. Only such a connection is an SSH
+ * login, which can register a device. */
+rule S_Hello_Bootstrap:
+    [ C2S($D, k, <'hello', bt>), Grant($D, bt), Fr(~rt) ]
+  --[ AcceptBootstrap($D, bt, k), Act($D, bt, k), Check($D, bt), Owner($D, k) ]->
+    [ !Conn($D, k, 'owner', bt), !SshConn($D, k),
+      !Slot($D, ~rt, 'owner', bt), S2C($D, k, <'welcome', ~rt>) ]
+
+/* A device token (fast start): works while the device is registered. */
+rule S_Hello_Device:
+    [ C2S($D, k, <'hello', dt>), !IsDevice($D, h(dt)), Fr(~rt) ]
+  --[ AcceptDevice($D, dt, k), Act($D, h(dt), k), Check($D, h(dt)), Owner($D, k) ]->
+    [ !Conn($D, k, 'owner', h(dt)),
+      !Slot($D, ~rt, 'owner', h(dt)), S2C($D, k, <'welcome', ~rt>) ]
+
+/* A share link: one session, read-only or read-write. */
+rule S_Hello_Share:
+    [ C2S($D, k, <'hello', st>), !ShareGrant($D, st, sess, mode), Fr(~rt) ]
+  --[ AcceptShare($D, st, k), Act($D, st, k), Check($D, st), Guest($D, k, sess, mode) ]->
+    [ !Conn($D, k, <'guest', sess, mode>, st),
+      !Slot($D, ~rt, <'guest', sess, mode>, st), S2C($D, k, <'welcome', ~rt>) ]
+
+/* A resume token: the same client on a new connection, with the same role
+ * and root. A resumed connection is not an SSH login. */
+rule S_Hello_Resume:
+    [ C2S($D, k, <'hello', rt>), !Slot($D, rt, role, root) ]
+  --[ Resume($D, rt, k), Act($D, root, k), Check($D, root) ]->
+    [ !Conn($D, k, role, root) ]
+
+/* ------------------------------------------------------------------ */
+/* Actions on a connection.                                           */
+
+/* Input into a session. An owner can use any session. */
+rule S_Input_Owner:
+    [ !Conn($D, k, 'owner', root), C2S($D, k, <'input', sess, m>) ]
+  --[ Input($D, sess, m, k), Act($D, root, k), Check($D, root) ]->
+    [ ]
+
+/* A guest types only into its session, and only with a read-write link. */
+rule S_Input_Guest:
+    [ !Conn($D, k, <'guest', sess, 'rw'>, root), C2S($D, k, <'input', any, m>) ]
+  --[ Input($D, sess, m, k), Act($D, root, k), Check($D, root) ]->
+    [ ]
+
+/* `qsh share`: an owner makes a link for one session. The owner gives it to
+ * a guest, who is not trusted: the link is public. */
+rule S_Share:
+    [ !Conn($D, k, 'owner', root), C2S($D, k, <'share', sess, mode>), Fr(~st) ]
+  --[ ShareCreated($D, ~st, sess, mode), Act($D, root, k), Check($D, root) ]->
+    [ !ShareGrant($D, ~st, sess, mode), S2C($D, k, <'link', ~st>), Out(~st) ]
+
+/* Register a device: only on a connection that logged in over SSH. */
+rule S_Device:
+    [ !SshConn($D, k), !Conn($D, k, 'owner', bt), C2S($D, k, 'device'), Fr(~dt) ]
+  --[ MintDevice($D, ~dt, k), Act($D, bt, k), Check($D, bt) ]->
+    [ !IsDevice($D, h(~dt)), S2C($D, k, <'device', ~dt>) ]
+
+/* `qsh devices --revoke`, or 30 days without use. The daemon removes the
+ * device, and ends the clients that it logged in. */
+rule Revoke_Device:
+    [ !IsDevice($D, hd) ]
+  --[ Revoke($D, hd) ]->
+    [ ]
+
+restriction DeviceTable:
+  "All D r #i #j. Check(D, r) @ #i & Revoke(D, r) @ #j ==> #i < #j"
+
+/* ------------------------------------------------------------------ */
+/* The honest client.                                                 */
+
+/* A new client gets a resume token; a resumed client keeps its token. */
+rule C_Welcome_Boot:
+    [ CConn($C, $D, k, 'boot'), S2C($D, k, <'welcome', ~rt>) ]
+  --[ Attached($C, $D, k, 'boot') ]->
+    [ !CConn2($C, $D, k, 'boot'), !CSlot($C, $D, ~rt) ]
+
+rule C_Welcome_Device:
+    [ CConn($C, $D, k, 'dev'), S2C($D, k, <'welcome', ~rt>) ]
+  --[ Attached($C, $D, k, 'dev') ]->
+    [ !CConn2($C, $D, k, 'dev'), !CSlot($C, $D, ~rt) ]
+
+/* The user types. */
+rule C_Type:
+    [ !CConn2($C, $D, k, kind), Fr(~m) ]
+  --[ Typed($C, $D, $sess, ~m, k) ]->
+    [ C2S($D, k, <'input', $sess, ~m>) ]
+
+/* After an SSH login, the client asks for a device token and stores it. */
+rule C_Ask_Device:
+    [ !CConn2($C, $D, k, 'boot') ]
+  -->
+    [ C2S($D, k, 'device'), CWaitDevice($C, $D, k) ]
+
+rule C_Store_Device:
+    [ CWaitDevice($C, $D, k), S2C($D, k, <'device', ~dt>) ]
+  --[ StoreDevice($C, $D, ~dt) ]->
+    [ !Stored($C, $D, ~dt) ]
+
+/* The owner asks for a share link. */
+rule C_Share:
+    [ !CConn2($C, $D, k, kind) ]
+  -->
+    [ C2S($D, k, <'share', $sess, $mode>) ]
+
+/* Theft of the device token file (~/.qsh/known) of a client machine. */
+rule Compromise_Device:
+    [ !Stored($C, $D, ~dt) ]
+  --[ CompromiseDevice($C, $D, ~dt) ]->
+    [ Out(~dt) ]
+
+/* ------------------------------------------------------------------ */
+/* Sanity: the model can do what qsh does.                            */
+
+lemma exec_ssh_login: exists-trace
+  "Ex C D bt k #i #j #l. SshLogin(C, D, bt) @ #i & AcceptBootstrap(D, bt, k) @ #j
+     & Attached(C, D, k, 'boot') @ #l
+     & not (Ex #r. CompromiseDaemon(D) @ #r)"
+
+lemma exec_fast_start: exists-trace
+  "Ex C D dt k #i #j. StoreDevice(C, D, dt) @ #i & AcceptDevice(D, dt, k) @ #j
+     & not (Ex #r. CompromiseDaemon(D) @ #r)
+     & not (Ex C2 #r. CompromiseDevice(C2, D, dt) @ #r)"
+
+/* The user logs in over SSH and makes a read-write link; a guest (the
+ * attacker, who got the link) joins with it and types. */
+lemma exec_guest_input: exists-trace
+  "Ex C D bt k0 st sess m k #l #a #s #i #j.
+       SshLogin(C, D, bt) @ #l & AcceptBootstrap(D, bt, k0) @ #a
+     & ShareCreated(D, st, sess, 'rw') @ #s & Act(D, bt, k0) @ #s
+     & AcceptShare(D, st, k) @ #i & Guest(D, k, sess, 'rw') @ #i
+     & Input(D, sess, m, k) @ #j & Act(D, st, k) @ #j
+     & not (Ex #r. CompromiseDaemon(D) @ #r)
+     & not (Ex C2 dt #r. CompromiseDevice(C2, D, dt) @ #r)"
+
+lemma exec_stolen_until_revoke: exists-trace
+  "Ex C D dt k #c #i #j. CompromiseDevice(C, D, dt) @ #c & AcceptDevice(D, dt, k) @ #i
+     & Revoke(D, h(dt)) @ #j & #i < #j
+     & not (Ex #r. CompromiseDaemon(D) @ #r)"
+
+/* ------------------------------------------------------------------ */
+/* Security properties.                                               */
+
+/* 1. A bootstrap token works only if an SSH login made it ... */
+lemma bootstrap_needs_ssh:
+  "All D bt k #i. AcceptBootstrap(D, bt, k) @ #i ==>
+     Ex C #j. SshLogin(C, D, bt) @ #j & #j < #i"
+
+/* ... and only once. */
+lemma bootstrap_once:
+  "All D bt k1 k2 #i #j. AcceptBootstrap(D, bt, k1) @ #i & AcceptBootstrap(D, bt, k2) @ #j
+     ==> #i = #j"
+
+/* 2. The attacker never learns a bootstrap token, unless the daemon key
+ *    was stolen. */
+lemma bootstrap_secret:
+  "All C D bt #i. SshLogin(C, D, bt) @ #i ==>
+     not (Ex #j. K(bt) @ #j) | (Ex #r. CompromiseDaemon(D) @ #r)"
+
+/* 3. Only an SSH login can make a device token: a stolen device token, a
+ *    resumed client or a guest cannot make more tokens. */
+lemma device_needs_ssh_login:
+  "All D dt k #i. MintDevice(D, dt, k) @ #i ==>
+     Ex bt #j. AcceptBootstrap(D, bt, k) @ #j & #j < #i"
+
+/* 4. A device token stays secret unless its file is stolen, or the daemon
+ *    key is stolen. */
+lemma device_secret:
+  "All D dt k #i. MintDevice(D, dt, k) @ #i ==>
+     not (Ex #j. K(dt) @ #j)
+     | (Ex C #r. CompromiseDevice(C, D, dt) @ #r)
+     | (Ex #r. CompromiseDaemon(D) @ #r)"
+
+/* 5. After a device is revoked, nothing more happens with its root: no new
+ *    connection with its token, no resume of its clients, no action on its
+ *    connections. */
+lemma revoke_is_final:
+  "All D hd k #i #j. Revoke(D, hd) @ #i & Act(D, hd, k) @ #j ==> #j < #i"
+
+/* 6. Owner rights come from SSH: every owner connection has a root that an
+ *    SSH login made, directly (bootstrap) or through a device token that
+ *    such a login registered. */
+lemma owner_rooted_in_ssh:
+  "All D k #i. Owner(D, k) @ #i ==>
+     (Ex bt #j. AcceptBootstrap(D, bt, k) @ #j)
+     | (Ex dt k0 bt #j #l. AcceptDevice(D, dt, k) @ #i & MintDevice(D, dt, k0) @ #j
+          & AcceptBootstrap(D, bt, k0) @ #l & #l < #j & #j < #i)"
+
+/* 7. Input reaches a session only from the user, or from a holder of a
+ *    credential that allows it: a stolen device token, a read-write link
+ *    for this session, or the stolen daemon key. So a guest types only into
+ *    the session of its link, and only with a read-write link. (A lemma per
+ *    connection would be wrong: one QUIC connection can carry a guest stream
+ *    and, with a second credential, an owner stream.) */
+lemma input_authorized:
+  "All D sess m k #i. Input(D, sess, m, k) @ #i ==>
+       (Ex C #j. Typed(C, D, sess, m, k) @ #j & #j < #i)
+     | (Ex C dt #r. CompromiseDevice(C, D, dt) @ #r & #r < #i)
+     | (Ex st #r. ShareCreated(D, st, sess, 'rw') @ #r & #r < #i)
+     | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+/* 8. Forward secrecy: what the user types stays secret, also when the
+ *    daemon key is stolen later. */
+lemma typed_secret:
+  "All C D sess m k #i. Typed(C, D, sess, m, k) @ #i ==>
+     not (Ex #j. K(m) @ #j) | (Ex #r. CompromiseDaemon(D) @ #r & #r < #i)"
+
+end

@@ -50,8 +50,10 @@ build in `~/.qsh/known/` (mode 0600). The next `qsh host` connects with QUIC
 and the token directly: no SSH, so the prompt shows after the QUIC handshake
 and one round trip.
 
-- If the direct connection has not worked after 6 RTT (0.4–1.5 s), the SSH
-  login starts too, and the first that works wins. If the last login went
+- The handshake uses the stored RTT, so a lost packet goes again after about
+  3 RTT (not after 0.5 s). If the direct connection has not worked after
+  8 RTT (0.5–1.5 s), the SSH login starts too, and the first that works wins;
+  the other one stops (its ssh process is killed). If the last login went
   through the SSH tunnel (no UDP path), SSH starts at once.
 - If the daemon rejects the token, the client deletes it and logs in over
   SSH.
@@ -89,9 +91,13 @@ program (vim, htop) also gets a SIGWINCH, so it redraws itself at once.
   3 s without an echo the client moves to a new UDP socket (new NAT mapping,
   new interface), and at the same time races a new connection (UDP and the SSH
   tunnel). The first path that works continues the session at its offset. No
-  output is lost or shown twice. After 10 s the client tries again and again.
-- On the SSH tunnel, the client tests UDP every 30 s and moves the live
-  connection back to UDP when it works.
+  output is lost or shown twice.
+- After 10 s the client reconnects and does not give up: a fresh UDP
+  handshake starts every second (new socket, the last RTT), and the SSH
+  tunnel is tried at the same time. After an outage of 45 s, the session
+  continued 0.36 s after the network came back (ssh: 16 s).
+- On the SSH tunnel, the client tests UDP every 10 s (a few packets) and
+  moves the live connection back to UDP when it works.
 - A suspended laptop resumes in about 0.2 s after wake-up.
 
 ### Status overlay
@@ -330,7 +336,14 @@ another). It does not log in again. It was faster than scp in a test
   token that is not used for 30 days stops working. Only a login over SSH
   can make a device token, so a stolen token cannot make more tokens. On the
   server, `qsh devices` lists the devices, and `qsh devices --revoke ID` (or
-  `all`) removes them. `--no-fast` turns fast start off for a client.
+  `all`) removes them. A revoke also ends the clients that the device logged
+  in: their connections close and their resume tokens stop working (the
+  real user's client then logs in again over SSH). `--no-fast` turns fast
+  start off for a client.
+- These rules are proven in a formal model (Tamarin): the connection to the
+  pinned daemon, single-use bootstrap tokens, device tokens only from SSH
+  logins, final revocation, input only with a credential for that session,
+  and forward secrecy of what you type. See [formal/README.md](formal/README.md).
 - The server can use your local clipboard, send files to your download folder
   and open http(s) links. Disable with `--no-clipboard`, `--no-receive`,
   `--no-open`. Reads of local files by path need your consent in a dialog
@@ -437,6 +450,49 @@ than the default (Cubic). The network changes from run to run (the ssh
 startup median was 2064 ms in another run), so compare clients in the same
 run.
 
+### Weak networks
+
+`tests/netlab` is a network lab for one Linux machine (as root). `netem.py`
+is a network emulator between two TUN devices (no netem module or network
+namespace needed): delay, jitter, loss with bursts, reordering, duplicates,
+a rate limit with a queue, outages and blocked UDP. `lab.sh` starts it with
+an sshd on the server side, which gives logins a separate `QSH_HOME`, so the
+lab does not touch the real user's daemon. `run.py` runs ssh and qsh through
+it and checks the results, not only the times: each output line must arrive
+once and in order (for qsh: in the session stream that the client got), and
+typed commands must run once with the exact text.
+
+```sh
+tests/netlab/lab.sh start
+tests/netlab/run.py [--only startup,echo,integrity,typing,outage,udpblock,ctrlc,idle,revoke,soak]
+tests/netlab/lab.sh stop
+```
+
+Profiles (one way; the round trip is twice the delay): fiber 10 ms; wifi
+20±10 ms, 1 % loss; lte 40±20 ms, 3 % loss in bursts; bad 80±40 ms, 10 %
+loss, 2 % reordering; awful 150±60 ms, 25 % loss; slow 1 Mbit/s with a 2 s
+queue. Results:
+
+| Test | ssh | qsh |
+|---|---|---|
+| Startup, lte / bad / awful | 1.2 s / 2.5 s / 12.9 s (1 of 3 failed) | 0.3 s / 0.5 s / 4.0 s |
+| Key echo, lte / awful (median) | 111 ms / 1692 ms | 0 ms (local echo); without: 96 ms / 1115 ms |
+| 60,000 lines, lte / bad / awful | 27 s / not done in 10 min / not done in 10 min | 7.5 s / 26 s / 48 s, each line once, in order |
+| 300 typed characters in pieces, lte to awful | ran once | ran once |
+| Outage 3 s / 8 s / 20 s / 45 s: output again after | 1.7 s / 0.9 s / 9.9 s / 16.2 s | 0.09 s / 0.06 s / 0.37 s / 0.36 s |
+| Command typed during the outage | ran once | ran once |
+| UDP blocked during a session | – | output on the SSH tunnel after 5.1 s; back on UDP 0.5 s after UDP works |
+| Ctrl-C in a flood, lte / slow | 7.6 s / 9.9 s | 1.0 s / 6.2 s |
+| 60 s idle, lte to awful | – | no "no reply" badge |
+
+On the slow link, most of qsh's 6.2 s is output that was already in the
+2 s queue and in flight when Ctrl-C arrived.
+
+### Formal model
+
+`formal/` has the Tamarin model of the access rules and its results; see
+[formal/README.md](formal/README.md).
+
 ## Source layout
 
 | File | Content |
@@ -464,6 +520,8 @@ run.
 | `src/client/rpc.rs` | requests from the server, `qsh cp` |
 | `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |
 | `tests/bench/bench.py` | benchmark against ssh |
+| `tests/netlab/` | weak network lab: emulator, lab setup, tests |
+| `formal/` | Tamarin model: connection (`tls.spthy`) and access rules (`qsh.spthy`) |
 
 ## Debug
 

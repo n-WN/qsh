@@ -51,7 +51,10 @@ and the token directly: no SSH, so the prompt shows after the QUIC handshake
 and one round trip.
 
 - The handshake uses the stored RTT, so a lost packet goes again after about
-  3 RTT (not after 0.5 s). If the direct connection has not worked after
+  3 RTT (not after 0.5 s). QUIC doubles that timeout for each loss in a row,
+  so a fresh handshake (a new socket) starts every 2 RTT (0.25–1 s), up to
+  four at a time; the first that completes wins. On lossy links this cut the
+  slow tail of the handshake (p90 1.7 s to 1.0 s). If the direct connection has not worked after
   8 RTT (0.5–1.5 s), the SSH login starts too, and the first that works wins;
   the other one stops (its ssh process is killed). If the last login went
   through the SSH tunnel (no UDP path), SSH starts at once.
@@ -98,10 +101,15 @@ program (vim, htop) also gets a SIGWINCH, so it redraws itself at once.
   new interface), and at the same time races a new connection (UDP and the SSH
   tunnel). The first path that works continues the session at its offset. No
   output is lost or shown twice.
+- After 1.5 s without an echo, the client starts the SSH helper in advance
+  (at most one SSH login a minute; the helper waits a minute for use). When
+  it is ready, the race starts at 2 s, and it needs no SSH login. With UDP
+  blocked during a session, output continued on the SSH tunnel after 3.1 s
+  (5.1 s without the helper in advance).
 - After 10 s the client reconnects and does not give up: a fresh UDP
-  handshake starts every second (new socket, the last RTT), and the SSH
-  tunnel is tried at the same time. After an outage of 45 s, the session
-  continued 0.36 s after the network came back (ssh: 16 s).
+  handshake starts every 0.5 s (new socket, the last RTT; up to six at a
+  time), and the SSH tunnel is tried at the same time. After an outage of
+  45 s, the session continued 0.38 s after the network came back (ssh: 16 s).
 - On the SSH tunnel, the client tests UDP every 10 s (a few packets) and
   moves the live connection back to UDP when it works.
 - A suspended laptop resumes in about 0.2 s after wake-up.
@@ -144,6 +152,29 @@ All input goes into a log until the server acknowledges it. On a new
 connection the server tells how much input it has; the client sends the rest.
 Keys typed while the link is down show as predictions and arrive exactly once.
 
+### Copies of keys and echoes
+
+A lost packet with a key press or its echo waits for QUIC's probe timeout
+(about srtt + 4 rttvar + 25 ms, doubled for each loss in a row), because no
+later packet shows the loss. So on a path that lost a packet in the last 20 s,
+small interactive data also goes in QUIC datagrams, as copies, at δ, 3δ, 7δ
+and 15δ after the original (δ = RTT/8, 8–40 ms), until it is acknowledged:
+
+- Keys: each copy holds all input that the server has not acknowledged, with
+  its place in the input count. One copy that arrives fills all gaps.
+- Output: a batch of at most 1000 bytes (the echo, with the input
+  acknowledgement), with its place in the stream, while at most 2 KB is
+  unacknowledged. Bulk output gets no copies: with many packets in flight,
+  QUIC finds a loss soon by itself.
+
+The stream stays the reliable path. The receiver uses a copy only at its
+exact place and skips that part when the stream brings it, so nothing is
+applied twice; the server takes input from the stream and from copies under
+one lock, in order. On a clean path (and on the SSH tunnel) there are no
+copies. In the lab, the copies cut the slow tail of the echo: without them,
+27 of 60 echoes on the awful link took more than twice the median, with
+them 11 of 60; on bad, p90 went from 1.05 s to 0.24 s.
+
 ### Several clients
 
 The client that types (or attached) last sets the pty size; its output goes to
@@ -162,8 +193,10 @@ Ctrl-C. So the congestion controller is BBR: it measures the bottleneck rate
 and the round trip and does not fill the queues, and a random loss does not
 slow it down (Cubic, quinn's default, does both). Two changes to quinn's BBR:
 
-- It starts with 14.7 KB in flight (RFC 9002), not 240 KB: that was 2 s in
-  the queue of a 1 Mbit/s link before BBR knew the rate.
+- It starts with 32 packets (38.4 KB) in flight, not 240 KB: with 240 KB, a
+  Ctrl-C right after the start of a 1 Mbit/s link took 4 s; with 32 packets
+  0.44 s. A sweep in the lab chose the value: 10 packets (RFC 9002) moved
+  3.4 MB on a fast link 38 % slower, 64 packets made that Ctrl-C take 1 s.
 - Its window never falls below 16 packets (19 KB). On an idle connection BBR
   estimates the rate from the pings alone, and its window fell to 4 packets:
   a few lost pings then blocked pings and keys until loss detection, seconds
@@ -488,7 +521,12 @@ Profiles (one way; the round trip is twice the delay): fiber 10 ms; wifi
 20±10 ms, 1 % loss; lte 40±20 ms, 3 % loss in bursts; bad 80±40 ms, 10 %
 loss, 2 % reordering; awful 150±60 ms, 25 % loss; slow 1 Mbit/s with a 2 s
 queue; slow-shallow 1 Mbit/s with a 0.2 s queue; dsl 10 Mbit/s with a 0.5 s
-queue. Results (ranges are from several runs):
+queue. In these, a loss burst has a mean length in packets, so a sparse flow
+(pings, keys) sees bursts of seconds. The `-t` profiles have loss in time, as
+a radio fade: lte-t 3 % of the time in fades of 60 ms (mean), bad-t 10 % in
+150 ms, awful-t 25 % in 300 ms; lossy has 5 % independent loss. Several labs
+can run at once (`QSH_LAB_NET`, `--net`). Results (ranges are from several
+runs):
 
 | Test | ssh | qsh |
 |---|---|---|
@@ -513,8 +551,9 @@ Output rate (3.4 MB) and Ctrl-C after 4 s of flood, by link (`--only flow`):
 | slow-shallow | 0.08 MB/s, 9.3 s | 0.12 MB/s, 2.4 s | 0.12 MB/s, 0.31–0.37 s |
 | slow | 0.08 MB/s, 8.6 s | 0.12 MB/s, 4.2 s | 0.12 MB/s, 0.37–0.44 s |
 
-On the fiber profile, 3.4 MB is short: BBR starts with 14.7 KB in flight
-and needs a few round trips to reach the rate. With 25.9 MB, qsh moved
+On the fiber profile, 3.4 MB is short: BBR starts with a small window and
+needs a few round trips to reach the rate (these rows are from a start
+window of 10 packets; with 32 packets, 8.6 MB/s). With 25.9 MB, qsh moved
 9.9 MB/s there, as ssh. On the internet path above, qsh moved twice as much
 as ssh.
 
@@ -531,6 +570,8 @@ as ssh.
 | `build.rs`, `src/version.rs` | build id and time, the source inside the binary |
 | `src/proto.rs` | frames and messages |
 | `src/tls.rs` | certificate, fingerprint pinning, QUIC transport settings |
+| `src/copies.rs` | copies of small interactive data in datagrams |
+| `src/ablate.rs` | switches for the ablation study (`QSH_ABLATE`) |
 | `src/files.rs` | streaming archive for file transfer |
 | `src/tools.rs` | tools inside a session, and the clipboard shims |
 | `src/server/daemon.rs` | QUIC listener, attach and resume, flow control, input acknowledgements, sizes, local socket, in-place upgrade |
@@ -550,7 +591,7 @@ as ssh.
 | `src/client/rpc.rs` | requests from the server, `qsh cp` |
 | `src/client/clipboard.rs` | local clipboard (NSPasteboard on macOS) |
 | `tests/bench/bench.py` | benchmark against ssh |
-| `tests/netlab/` | weak network lab: emulator, lab setup, tests |
+| `tests/netlab/` | weak network lab: emulator, lab setup, tests, ablation study (`ablate.py`) |
 | `formal/` | Tamarin model: connection (`tls.spthy`) and access rules (`qsh.spthy`) |
 
 ## Debug
@@ -561,4 +602,5 @@ the raw session output that the client gets (and the input that it sends, to
 `/tmp/qsh.out.in`). `QSH_CC=cubic|newreno` changes the congestion controller
 of the process (default BBR); the daemon sends the output. `kill -USR1` /
 `kill -USR2` on the client moves the connection to a new UDP socket / to the
-SSH tunnel.
+SSH tunnel. `QSH_ABLATE=name,...` turns mechanisms off for measurements
+(`tests/netlab/ablate.py`; a wrong name stops qsh at start).

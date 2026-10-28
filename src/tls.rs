@@ -65,15 +65,26 @@ pub fn transport() -> quinn::TransportConfig {
     // 4-7 times faster on lossy links, and Ctrl-C on a 1 Mbit/s link with a
     // 2 s queue took 0.7 s instead of 3.7 s. QSH_CC=cubic|newreno for
     // measurements.
-    match std::env::var("QSH_CC").as_deref() {
-        Ok("cubic") => t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
-        Ok("newreno") => t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+    let cc = std::env::var("QSH_CC").ok().or_else(|| crate::ablate::off("bbr").then(|| "cubic".to_string()));
+    match cc.as_deref() {
+        Some("cubic") => t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        Some("newreno") => t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
         _ => {
-            // quinn starts BBR with 240 KB in flight: 2 s in the queue of a
-            // 1 Mbit/s link before BBR knows the rate. Start as RFC 9002 says.
+            // quinn starts BBR with 240 KB in flight: 4 s before a Ctrl-C
+            // took effect on a new 1 Mbit/s connection. In the lab, 32
+            // packets kept that at 0.44 s (64: 1.0 s) and moved 3.4 MB on a
+            // fast link 38 % faster than RFC 9002's 10 packets.
             let mut bbr = quinn::congestion::BbrConfig::default();
-            bbr.initial_window(14720);
-            t.congestion_controller_factory(Arc::new(Floored(Arc::new(bbr))))
+            if let Some(w) = crate::ablate::value("initwin") {
+                bbr.initial_window(w);
+            } else if !crate::ablate::off("initwin") {
+                bbr.initial_window(INITIAL_WINDOW);
+            }
+            if crate::ablate::off("floor") {
+                t.congestion_controller_factory(Arc::new(bbr))
+            } else {
+                t.congestion_controller_factory(Arc::new(Floored(Arc::new(bbr))))
+            }
         }
     };
     t
@@ -85,6 +96,7 @@ pub fn transport() -> quinn::TransportConfig {
 /// the window, so 4 lost pings would block both until loss detection: seconds
 /// on a bad link, and a false "no reply" badge.
 const WINDOW_FLOOR: u64 = 16 * 1200;
+const INITIAL_WINDOW: u64 = 32 * 1200;
 
 struct Floored(Arc<quinn::congestion::BbrConfig>);
 

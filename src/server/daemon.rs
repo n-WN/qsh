@@ -23,6 +23,7 @@ use tokio::{
 
 use super::session::{self, ClientSlot, Session};
 use crate::{
+    copies,
     files, paths,
     proto::{self, Control, Hello, LocalReply, LocalReq, Reply, Rpc, SessionInfo, Welcome, kind},
     tls,
@@ -98,6 +99,16 @@ struct ConnCtx {
     device: Mutex<Option<String>>,
     /// The session that the client shows now (for `qsh cp` paths).
     current: Mutex<Option<Arc<Session>>>,
+    /// The terminal stream now, for input copies in datagrams (`copies`).
+    term: Mutex<Option<TermRef>>,
+}
+
+#[derive(Clone)]
+struct TermRef {
+    sid: u64,
+    sess: Arc<Session>,
+    id: u64,
+    epoch: u64,
 }
 
 struct Attached {
@@ -336,15 +347,28 @@ impl Daemon {
         let conn = inc.await?;
         self.conns.fetch_add(1, Ordering::SeqCst);
         let _guard = ConnGuard(self.clone());
-        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), ssh_login: AtomicBool::new(false), device: Mutex::new(None), current: Mutex::new(None) });
+        let ctx = Arc::new(ConnCtx { conn: conn.clone(), trusted: AtomicBool::new(false), ssh_login: AtomicBool::new(false), device: Mutex::new(None), current: Mutex::new(None), term: Mutex::new(None) });
         let (send, mut recv) = tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await??;
         let hello: Hello = tokio::time::timeout(Duration::from_secs(15), proto::read_msg(&mut recv)).await??;
 
-        // Echo datagrams: the client uses them to check the path end to end.
-        let c3 = conn.clone();
+        // Datagrams: copies of input, and pings to echo (the client uses
+        // them to check the path end to end).
+        let (c3, x3) = (conn.clone(), ctx.clone());
         tokio::spawn(async move {
             while let Ok(d) = c3.read_datagram().await {
-                let _ = c3.send_datagram(d);
+                match copies::decode(&d) {
+                    Some((copies::INPUT, sid, end, data)) => {
+                        let t = x3.term.lock().unwrap().clone();
+                        if let Some(t) = t.filter(|t| t.sid == sid)
+                            && let Some(start) = end.checked_sub(data.len() as u64)
+                        {
+                            take_input(&t.sess, t.id, t.epoch, start, data);
+                        }
+                    }
+                    _ => {
+                        let _ = c3.send_datagram(d);
+                    }
+                }
             }
         });
 
@@ -389,6 +413,8 @@ impl Daemon {
             *ctx.device.lock().unwrap() = att.device.clone();
         }
         *ctx.current.lock().unwrap() = Some(att.session.clone());
+        let sid = u64::from(recv.id());
+        *ctx.term.lock().unwrap() = Some(TermRef { sid, sess: att.session.clone(), id: att.id, epoch: att.epoch });
         // However this connection ends, the client is then gone (not a ghost
         // that looks connected and can hold the pty size).
         {
@@ -412,17 +438,49 @@ impl Daemon {
             return;
         }
 
+        let input_start = att.welcome.input_seen.unwrap_or(0);
+        let (conn, sess, id, want) = (ctx.conn.clone(), att.session.clone(), att.id, hello.copies);
         let writer = tokio::spawn(async move {
-            while let Some(b) = rx.recv().await {
-                if send.write_all(&b).await.is_err() {
-                    break;
+            // Small output batches get copies in datagrams on a lossy path
+            // (`copies`); `pos` is the place of a batch in this stream.
+            let mut pos = 0u64;
+            let mut watch = copies::LossWatch::new();
+            let mut sched = copies::Schedule::new(8);
+            loop {
+                tokio::select! {
+                    b = rx.recv() => {
+                        let Some(b) = b else { break };
+                        if want
+                            && b.len() <= copies::MAX_DATA
+                            && let Some(end) = copies::output_end(&b)
+                            && watch.lossy(&conn)
+                        {
+                            // Only sparse output: with more in flight, QUIC
+                            // finds a loss soon by itself.
+                            let acked = sess.st.lock().unwrap().clients.get(&id).map_or(end, |c| c.acked);
+                            if end.saturating_sub(acked) <= copies::SPARSE {
+                                sched.add(copies::encode(copies::OUTPUT, sid, pos, &b), end, conn.rtt());
+                            }
+                        }
+                        if send.write_all(&b).await.is_err() {
+                            break;
+                        }
+                        pos += b.len() as u64;
+                    }
+                    _ = copies::sleep_until(sched.next()) => {
+                        let acked = sess.st.lock().unwrap().clients.get(&id).map_or(u64::MAX, |c| c.acked);
+                        sched.retain(|p| p.end > acked);
+                        for d in sched.due(conn.rtt()) {
+                            let _ = conn.send_datagram(d);
+                        }
+                    }
                 }
             }
             let _ = send.finish();
         });
 
         let out = tokio::spawn(output_loop(self.clone(), att.session.clone(), ctx.conn.clone(), att.id, att.epoch, tx.clone(), att.start));
-        let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx).await;
+        let _ = input_loop(&att.session, att.id, att.epoch, &mut recv, &tx, input_start).await;
         {
             let mut st = att.session.st.lock().unwrap();
             if let Some(slot) = st.clients.get_mut(&att.id)
@@ -897,7 +955,8 @@ enum Next {
 /// is small, because everything in it goes before a Ctrl-C takes effect:
 /// 32 KB is 0.26 s on a 1 Mbit/s link (256 KB was 2 s).
 fn window(conn: &quinn::Connection) -> u64 {
-    (2 * conn.stats().path.cwnd).clamp(32 << 10, 4 << 20)
+    let min = crate::ablate::value("winmin").unwrap_or(if crate::ablate::off("win32k") { 256 << 10 } else { 32 << 10 });
+    (2 * conn.stats().path.cwnd).clamp(min, 4 << 20)
 }
 
 fn size_frame(s: (u16, u16, bool)) -> Vec<u8> {
@@ -1030,54 +1089,77 @@ async fn output_loop(d: Arc<Daemon>, sess: Arc<Session>, conn: quinn::Connection
     }
 }
 
-async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::RecvStream, tx: &mpsc::Sender<Vec<u8>>) -> Result<()> {
+/// Input from the stream or from a copy in a datagram; `start` is the input
+/// count before `p`. Only the part that the session does not have yet goes to
+/// the program. False if this client is gone.
+fn take_input(sess: &Arc<Session>, id: u64, epoch: u64, start: u64, p: &[u8]) -> bool {
+    let count = {
+        let mut st = sess.st.lock().unwrap();
+        let Some(slot) = st.clients.get_mut(&id) else { return false };
+        if slot.epoch != epoch {
+            return false;
+        }
+        let end = start + p.len() as u64;
+        // Had already (a copy and the stream bring the same input), or after
+        // a gap (the stream fills it first).
+        if end <= slot.input_seen || start > slot.input_seen {
+            return true;
+        }
+        let p = &p[(slot.input_seen - start) as usize..];
+        slot.input_seen = end;
+        let count = slot.input_seen;
+        if !slot.readonly && session::has_interrupt(p) && !crate::ablate::off("skip") {
+            slot.skip_at = Some(Instant::now() + SKIP_WAIT);
+        }
+        let ok = if slot.readonly {
+            false
+        } else if st.active != Some(id) {
+            if session::looks_like_report(p) {
+                false
+            } else {
+                sess.activate(&mut st, id);
+                true
+            }
+        } else {
+            true
+        };
+        // Under the lock: the stream and the datagrams take turns, and the
+        // order of the input stays.
+        if ok {
+            sess.write_input(p.to_vec());
+        }
+        count
+    };
+    // Acknowledge the input when the program had time to echo it.
+    let s = sess.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(ECHO_WAIT).await;
+        s.update_mode();
+        {
+            let mut st = s.st.lock().unwrap();
+            let head = st.ring.head();
+            if let Some(c) = st.clients.get_mut(&id)
+                && c.echo.is_none_or(|(n, _)| n < count)
+            {
+                c.echo = Some((count, head));
+            }
+        }
+        s.ack.send_modify(|x| *x = x.wrapping_add(1));
+    });
+    true
+}
+
+/// `pos`: the input count at the start of this stream (the client sends
+/// again what the server did not have).
+async fn input_loop(sess: &Arc<Session>, id: u64, epoch: u64, recv: &mut quinn::RecvStream, tx: &mpsc::Sender<Vec<u8>>, mut pos: u64) -> Result<()> {
     while let Some((k, p)) = proto::read_frame(recv).await? {
         match k {
             kind::INPUT => {
-                let (ok, count) = {
-                    let mut st = sess.st.lock().unwrap();
-                    let Some(slot) = st.clients.get_mut(&id) else { return Ok(()) };
-                    if slot.epoch != epoch {
-                        return Ok(());
-                    }
-                    slot.input_seen += p.len() as u64;
-                    let count = slot.input_seen;
-                    if !slot.readonly && session::has_interrupt(&p) {
-                        slot.skip_at = Some(Instant::now() + SKIP_WAIT);
-                    }
-                    let ok = if slot.readonly {
-                        false
-                    } else if st.active != Some(id) {
-                        if session::looks_like_report(&p) {
-                            false
-                        } else {
-                            sess.activate(&mut st, id);
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    (ok, count)
-                };
-                if ok {
-                    sess.write_input(p);
+                let start = pos;
+                pos += p.len() as u64;
+                if !take_input(sess, id, epoch, start, &p) {
+                    return Ok(());
                 }
-                // Acknowledge the input when the program had time to echo it.
-                let s = sess.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(ECHO_WAIT).await;
-                    s.update_mode();
-                    {
-                        let mut st = s.st.lock().unwrap();
-                        let head = st.ring.head();
-                        if let Some(c) = st.clients.get_mut(&id)
-                            && c.echo.is_none_or(|(n, _)| n < count)
-                        {
-                            c.echo = Some((count, head));
-                        }
-                    }
-                    s.ack.send_modify(|x| *x = x.wrapping_add(1));
-                });
             }
             kind::RESIZE if p.len() >= 4 => {
                 let v = |i: usize| if p.len() >= i + 2 { u16::from_be_bytes([p[i], p[i + 1]]) } else { 0 };

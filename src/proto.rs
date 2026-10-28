@@ -142,6 +142,9 @@ pub struct Hello {
     /// need not scroll old text away.
     #[serde(default)]
     pub clean: bool,
+    /// The client takes copies of small output in datagrams (`copies`).
+    #[serde(default)]
+    pub copies: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

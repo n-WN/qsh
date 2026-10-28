@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start or stop the network lab on a Linux machine (as root): the emulator
-# (netem.py), and an sshd on the server side of it (10.99.1.1:2222). Logins
+# (netem.py), and an sshd on the server side of it (10.N.1.1:2222, N=99 by default). Logins
 # to it get QSH_HOME=DIR/home/.qsh, so the lab's qsh daemon, sessions and
 # devices are separate from those of the real user. Use `qsh --server
 # DIR/qsh` (a copy of the binary), so that nothing is installed in ~/.qsh.
@@ -8,12 +8,16 @@
 # and the two TUN devices, which go away with the emulator.
 #
 # Usage: tests/netlab/lab.sh start|stop [DIR]   (default DIR: /tmp/qshlab)
+# A second lab at the same time: QSH_LAB_NET=98 QSH_LAB_TUN=r lab.sh start
+# /tmp/qshlab2 (addresses 10.98.x.x), and run.py --lab /tmp/qshlab2 --net 98.
 # Clients connect with:
 #   ssh -p 2222 -i DIR/key -o StrictHostKeyChecking=no \
 #       -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@10.99.0.2
 set -eu
 cmd=$1
 L=${2:-/tmp/qshlab}
+NET=${QSH_LAB_NET:-99}
+export QSH_LAB_NET=$NET
 here=$(cd "$(dirname "$0")" && pwd)
 
 stop() {
@@ -32,7 +36,7 @@ start)
     [ -f "$L/key" ] || ssh-keygen -q -t ed25519 -N '' -f "$L/key"
     echo "environment=\"QSH_HOME=$L/home/.qsh\" $(cat "$L/key.pub")" >"$L/authorized_keys"
     cat >"$L/sshd_config" <<EOF
-ListenAddress 10.99.1.1:2222
+ListenAddress 10.$NET.1.1:2222
 HostKey $L/hostkey
 AuthorizedKeysFile $L/authorized_keys
 PermitRootLogin prohibit-password

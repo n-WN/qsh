@@ -446,32 +446,53 @@ pub async fn race(rs: RaceSpec, helper: Option<Helper>, tunnel_delay: Duration) 
     }
 }
 
+/// QUIC handshakes over direct UDP: a new one (new socket, round-trip time
+/// `rtt`) starts every `every`, and up to `most` overlap; the first that
+/// completes wins. QUIC sends a lost handshake packet again only after a
+/// timeout that doubles each time, so on a lossy path a fresh attempt is often
+/// faster; after an outage, a first packet goes out within `every`. With a
+/// `limit`, it gives up after that time.
+pub async fn direct_race(addr: SocketAddr, fp: &str, rtt: Duration, every: Duration, most: usize, limit: Option<Duration>) -> Result<Candidate> {
+    let mut tries = tokio::task::JoinSet::new();
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let end = async {
+        match limit {
+            Some(l) => tokio::time::sleep(l).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(end);
+    let mut last = anyhow!("timeout");
+    loop {
+        tokio::select! {
+            _ = tick.tick(), if tries.len() < most => {
+                let fp = fp.to_string();
+                tries.spawn(async move {
+                    let ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(&addr)?, Arc::new(quinn::TokioRuntime))?;
+                    let c = ep.connect_with(client_config_rtt(&fp, rtt)?, addr, "qsh")?;
+                    let conn = tokio::time::timeout(Duration::from_secs(3), c).await.map_err(|_| anyhow!("timeout"))??;
+                    Ok::<_, anyhow::Error>((ep, conn))
+                });
+            }
+            Some(r) = tries.join_next() => match r {
+                Ok(Ok((ep, conn))) => return Ok(Candidate { ep, conn, kind: PathKind::Direct, helper: None }),
+                Ok(Err(e)) => last = e,
+                Err(_) => {}
+            },
+            _ = &mut end => return Err(last),
+        }
+    }
+}
+
 /// Like `race`, for a reconnect: it does not give up. A fresh UDP handshake
-/// (new socket, last round-trip time) starts every 0.5 s, and up to six
-/// overlap: when the network comes back, a first packet goes out within
-/// 0.5 s (the retransmissions of older attempts back off). SSH tunnel
+/// starts every 0.5 s, and up to six overlap (`direct_race`). SSH tunnel
 /// attempts run at the same time, one after the other.
 pub async fn race_until_up(rs: RaceSpec) -> Candidate {
     let direct = async {
-        let mut tries = tokio::task::JoinSet::new();
-        let mut every = tokio::time::interval(Duration::from_millis(500));
-        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                _ = every.tick(), if tries.len() < 6 => {
-                    let (addr, fp, rtt) = (rs.addr, rs.fp.clone(), rs.rtt);
-                    tries.spawn(async move {
-                        let ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, bind_any(&addr)?, Arc::new(quinn::TokioRuntime))?;
-                        let c = ep.connect_with(client_config_rtt(&fp, rtt)?, addr, "qsh")?;
-                        let conn = tokio::time::timeout(Duration::from_secs(3), c).await.map_err(|_| anyhow!("timeout"))??;
-                        Ok::<_, anyhow::Error>((ep, conn))
-                    });
-                }
-                Some(r) = tries.join_next() => {
-                    if let Ok(Ok((ep, conn))) = r {
-                        return Candidate { ep, conn, kind: PathKind::Direct, helper: None };
-                    }
-                }
+            if let Ok(c) = direct_race(rs.addr, &rs.fp, rs.rtt, Duration::from_millis(500), 6, None).await {
+                return c;
             }
         }
     };

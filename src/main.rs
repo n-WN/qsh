@@ -1,6 +1,8 @@
 //! qsh: a durable remote terminal over QUIC.
 
+mod ablate;
 mod client;
+mod copies;
 mod files;
 mod paths;
 mod proto;
@@ -277,6 +279,7 @@ fn main() {
 }
 
 fn real_main(cli: Cli) -> Result<i32> {
+    ablate::check()?;
     let rt = runtime();
     let r = run_cmd(&rt, cli);
     // The result is known: do not wait for blocking work that still runs (a

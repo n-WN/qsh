@@ -77,6 +77,7 @@ checks this end to end: the thief's client ends 0.1 s after the revoke.
 | `S_Hello_Share` | `Grant::Share`: one session, read-only or read-write |
 | `S_Hello_Resume` | `attach()` with `client_id` and the resume token; the slot keeps its role and device |
 | `S_Device` | `Rpc::Device`, only if `ConnCtx.ssh_login` |
+| `S_Input_Owner`, `S_Input_Guest` | `take_input`: input from the terminal stream, and from copies in datagrams (`src/copies.rs`) of the same connection. A copy goes only to the client slot of that connection's terminal stream (same stream id), with the same read-only check; it is one more message on the same channel `C2S($D, k, ...)`. |
 | `Revoke_Device`, `DeviceTable` | `LocalReq::Devices { revoke }`, then `end_device_clients` |
 | `Compromise_Device` | a copy of `~/.qsh/known/*.json` of a client machine |
 

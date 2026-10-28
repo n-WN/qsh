@@ -16,7 +16,11 @@ The profile is a JSON file; the emulator reads it again when it changes:
 
   delay_ms, jitter_ms   one-way delay, and uniform jitter (order is kept)
   loss                  probability that a packet is lost
-  burst                 mean length of a loss burst (Gilbert model); 0: independent
+  burst                 mean length of a loss burst in packets (Gilbert model);
+                        0: independent
+  burst_ms              loss in time instead: lossy periods with this mean length,
+                        in which all packets are lost, so that `loss` of the time
+                        is lossy (a radio fade does not wait for packets)
   reorder               probability that a packet can pass earlier packets
   dup                   probability of a duplicate
   rate_kbit, queue_ms   link rate, and the longest queue (then tail drop); 0: no limit
@@ -24,6 +28,9 @@ The profile is a JSON file; the emulator reads it again when it changes:
   block_udp             true: UDP packets are lost (TCP passes)
   up, down              objects with keys for one direction only
                         (up: client to server)
+
+More labs can run at the same time, each with its own net N (default 99:
+10.99.x.x) and TUN names (QSH_LAB_NET=N, QSH_LAB_TUN=prefix, default "q").
 
 Usage: netem.py PROFILE.json [STATS.json]
 """
@@ -42,8 +49,10 @@ import time
 
 TUNSETIFF = 0x400454CA
 IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
-A_HOST, A_PEER = bytes([10, 99, 0, 1]), bytes([10, 99, 0, 2])
-B_HOST, B_PEER = bytes([10, 99, 1, 1]), bytes([10, 99, 1, 2])
+NET = int(os.environ.get("QSH_LAB_NET", "99"))
+TUN = os.environ.get("QSH_LAB_TUN", "q")
+A_HOST, A_PEER = bytes([10, NET, 0, 1]), bytes([10, NET, 0, 2])
+B_HOST, B_PEER = bytes([10, NET, 1, 1]), bytes([10, NET, 1, 2])
 
 
 def tun(name, addr):
@@ -92,13 +101,22 @@ class Dir:
         self.last = 0.0  # delivery time of the last packet (keeps the order)
         self.free = 0.0  # when the link is free (rate limit)
         self.bad = False  # Gilbert state
+        self.flip = 0.0  # time of the next change of state (burst_ms)
         self.stats = {"packets": 0, "lost": 0, "queue_drop": 0, "sent": 0}
 
     def admit(self, p, prof, now, seq):
         self.stats["packets"] += 1
         q = {**prof, **prof.get(self.name, {})}
-        loss, burst = q.get("loss", 0), q.get("burst", 0)
-        if burst > 1 and 0 < loss < 1:
+        loss, burst, burst_ms = q.get("loss", 0), q.get("burst", 0), q.get("burst_ms", 0)
+        if burst_ms and 0 < loss < 1:
+            if now - self.flip > 60:
+                self.flip = now
+            while now >= self.flip:
+                self.bad = not self.bad
+                mean = burst_ms if self.bad else burst_ms * (1 - loss) / loss
+                self.flip += random.expovariate(1000 / mean)
+            lost = self.bad
+        elif burst > 1 and 0 < loss < 1:
             if self.bad:
                 self.bad = random.random() >= 1 / burst
             else:
@@ -140,8 +158,8 @@ class Dir:
 def main():
     prof_path = sys.argv[1]
     stats_path = sys.argv[2] if len(sys.argv) > 2 else None
-    fa = tun("qa", "10.99.0.1/24")
-    fb = tun("qb", "10.99.1.1/24")
+    fa = tun(TUN + "a", f"10.{NET}.0.1/24")
+    fb = tun(TUN + "b", f"10.{NET}.1.1/24")
     up = Dir("up", fb, B_PEER, B_HOST)
     down = Dir("down", fa, A_PEER, A_HOST)
     by_fd = {fa: up, fb: down}

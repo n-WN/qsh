@@ -25,6 +25,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use tokio::sync::mpsc;
 
+use crate::copies;
 use crate::proto::{self, Control, Hello, Welcome, kind};
 use crate::version::Build;
 use net::{Candidate, Link, PathKind, SshSpec, Transport};
@@ -102,6 +103,51 @@ impl InputLog {
 
     fn reset(&mut self) {
         *self = InputLog::default();
+    }
+
+    /// The count up to which the server acknowledged (or the log forgot).
+    fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The count after all input, and the input after `base`.
+    fn unacked(&self) -> (u64, Vec<u8>) {
+        (self.sent, self.since(0))
+    }
+}
+
+/// Copies of the keys that the server has not acknowledged, in datagrams
+/// (`copies`). Each copy has all of them: one copy that arrives fills all
+/// gaps.
+struct InputCopies {
+    conn: quinn::Connection,
+    sid: u64,
+    watch: copies::LossWatch,
+    sched: copies::Schedule,
+}
+
+impl InputCopies {
+    fn new(conn: &quinn::Connection, send: &quinn::SendStream) -> InputCopies {
+        InputCopies { conn: conn.clone(), sid: u64::from(send.id()), watch: copies::LossWatch::new(), sched: copies::Schedule::new(1) }
+    }
+
+    /// Keys went out on the stream.
+    fn sent(&mut self, sh: &Shared) {
+        if !self.watch.lossy(&self.conn) {
+            return;
+        }
+        let (end, data) = sh.input.lock().unwrap().unacked();
+        if !data.is_empty() && data.len() <= copies::MAX_DATA {
+            self.sched.add(copies::encode(copies::INPUT, self.sid, end, &data), end, self.conn.rtt());
+        }
+    }
+
+    fn fire(&mut self, sh: &Shared) {
+        let acked = sh.input.lock().unwrap().base();
+        self.sched.retain(|p| p.end > acked);
+        for d in self.sched.due(self.conn.rtt()) {
+            let _ = self.conn.send_datagram(d);
+        }
     }
 }
 
@@ -346,7 +392,7 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
     // timers back off), so the direct path tries again with a new connection,
     // until the daemon refuses the token or 60 s have passed. Not for a start
     // that makes a session: the first attempt may have made it.
-    let again = !hello.new && hello.command.is_empty();
+    let again = !hello.new && hello.command.is_empty() && !crate::ablate::off("fastretry");
     let fast = async {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -399,9 +445,22 @@ async fn connect(opts: &Opts, hello: &Hello, t0: Instant) -> Result<Attached> {
 /// One attempt of a fast start. `Fail::Retry`: the attempt failed, another
 /// one can work.
 async fn connect_fast(opts: &Opts, spec: &SshSpec, k: &known::Known, hello: &Hello, t0: Instant) -> std::result::Result<Attached, Fail> {
-    let link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone())).map_err(Fail::Fatal)?;
-    let rtt = Duration::from_millis(k.rtt_ms * 5 / 4).clamp(Duration::from_millis(25), Duration::from_millis(300));
-    let conn = link.connect_rtt(rtt, Duration::from_secs(3)).await.map_err(Fail::Retry)?;
+    let mut link = Link::new(k.addr, &k.fp, opts.transport, Some(spec.clone())).map_err(Fail::Fatal)?;
+    let rtt = if crate::ablate::off("knownrtt") {
+        Duration::from_millis(150)
+    } else {
+        Duration::from_millis(k.rtt_ms * 5 / 4).clamp(Duration::from_millis(25), Duration::from_millis(300))
+    };
+    let conn = if crate::ablate::off("fastrace") {
+        link.connect_rtt(rtt, Duration::from_secs(3)).await.map_err(Fail::Retry)?
+    } else {
+        // On a lossy path, a fresh handshake every two round trips (up to
+        // four at a time) is faster than the backed-off retransmissions.
+        let every = (rtt * 2).clamp(Duration::from_millis(250), Duration::from_secs(1));
+        let c = net::direct_race(k.addr, &k.fp, rtt, every, 4, Some(Duration::from_secs(4))).await.map_err(Fail::Retry)?;
+        link.adopt(c)
+    };
+    crate::paths::log(format!("startup: QUIC connected (fast) {:?}", t0.elapsed()));
     let mut h = hello.clone();
     h.token = k.token.clone();
     h.server_addr = k.addr.to_string();
@@ -491,6 +550,9 @@ pub async fn run(opts: Opts) -> Result<i32> {
     let t0 = Instant::now();
     let (term_name, terminfo, env) = term_env();
     crate::paths::log(format!("startup: terminal info {:?}", t0.elapsed()));
+    if let Ok(a) = std::env::var("QSH_ABLATE") {
+        crate::paths::log(format!("ablate: {a}"));
+    }
 
     let mut hello = Hello {
         version: proto::VERSION,
@@ -510,6 +572,7 @@ pub async fn run(opts: Opts) -> Result<i32> {
         new: opts.new_session,
         // The screen is made blank below, before any session output.
         clean: true,
+        copies: true,
     };
     let Attached { mut link, conn, send, recv, welcome: w } = connect(&opts, &hello, t0).await?;
     crate::paths::log(format!("startup: attached {:?}", t0.elapsed()));
@@ -625,14 +688,18 @@ fn resend_after(sh: &Shared, w: &Welcome) -> Vec<u8> {
 
 /// Send keys to the server. They are in the input log first: if the write
 /// fails, they go again on the next connection.
-async fn send_input(sh: &Shared, send: &mut quinn::SendStream, b: &[u8]) -> bool {
+async fn send_input(sh: &Shared, send: &mut quinn::SendStream, cp: &mut InputCopies, b: &[u8]) -> bool {
     if b.is_empty() {
         return true;
     }
     let end = sh.input.lock().unwrap().push(b);
     let _ = sh.out.try_send(Out::Typed { data: b.to_vec(), end });
     crate::paths::dump(true, b);
-    send.write_all(&proto::frame(kind::INPUT, b)).await.is_ok()
+    if send.write_all(&proto::frame(kind::INPUT, b)).await.is_err() {
+        return false;
+    }
+    cp.sent(sh);
+    true
 }
 
 fn info_lines(conn: &quinn::Connection, link: &Link, hello: &Hello) -> Vec<(String, bool)> {
@@ -672,7 +739,9 @@ async fn drive(
         return Outcome::Lost("write".into());
     }
 
-    let mut reader = Reader::spawn(sh, recv);
+    let mut cp = InputCopies::new(&conn, &send);
+    let (copy_tx, _) = tokio::sync::broadcast::channel::<bytes::Bytes>(64);
+    let mut reader = Reader::spawn(sh, recv, copy_tx.subscribe());
     let c2 = conn.clone();
     let sh3 = sh.clone();
     let acceptor = tokio::spawn(async move {
@@ -684,9 +753,17 @@ async fn drive(
     // enough: when only the upstream direction fails, data still comes in.
     let last_echo = Arc::new(Mutex::new(Instant::now()));
     let le = last_echo.clone();
-    let c4 = conn.clone();
+    let (c4, copy_tx4) = (conn.clone(), copy_tx.clone());
     let echo = tokio::spawn(async move {
         while let Ok(d) = c4.read_datagram().await {
+            match d.first() {
+                Some(&copies::OUTPUT) => {
+                    let _ = copy_tx4.send(d);
+                    continue;
+                }
+                Some(b'P') => {}
+                _ => continue,
+            }
             let gap = std::mem::replace(&mut *le.lock().unwrap(), Instant::now()).elapsed();
             if gap > Duration::from_millis(1500) {
                 let seq = d.get(1..5).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
@@ -699,11 +776,18 @@ async fn drive(
     let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Result<Vec<String>>>();
     let mut upload: Option<Upload> = None;
 
+    let ping_every = if crate::ablate::off("ping4") { Duration::from_secs(1) } else { PING_EVERY };
     let mut tick = tokio::time::interval(PING_EVERY);
     let mut last_ping = Instant::now() - Duration::from_secs(10);
     let mut seq: u32 = 0;
     let mut rebound = false;
     let mut racing = false;
+    // An SSH helper that starts when the echoes stop for a moment: if the path
+    // stays dead (UDP blocked), the tunnel need not wait for an SSH login.
+    let (warm_tx, mut warm_rx) = mpsc::unbounded_channel::<Result<net::Helper>>();
+    let mut warm: Option<(net::Helper, Instant)> = None;
+    let mut warming = false;
+    let mut last_warm = Instant::now() - Duration::from_secs(120);
     let mut last_probe = Instant::now() - Duration::from_secs(25);
     let mut probing = false;
     let mut predict_sent = (false, u128::MAX);
@@ -724,13 +808,13 @@ async fn drive(
                                 q.extend_from_slice(&b);
                                 upload = None;
                                 ui.note("qsh ⇪ upload stopped", true, 3);
-                                if !send_input(sh, &mut send, &q).await {
+                                if !send_input(sh, &mut send, &mut cp, &q).await {
                                     break Outcome::Lost("write".into());
                                 }
                             } else {
                                 u.queued.extend_from_slice(&b);
                             }
-                        } else if !send_input(sh, &mut send, &b).await {
+                        } else if !send_input(sh, &mut send, &mut cp, &b).await {
                             break Outcome::Lost("write".into());
                         }
                     }
@@ -753,7 +837,7 @@ async fn drive(
                             let b = drop::wrap(&p);
                             if let Some(u) = &mut upload {
                                 u.queued.extend_from_slice(&b);
-                            } else if !send_input(sh, &mut send, &b).await {
+                            } else if !send_input(sh, &mut send, &mut cp, &b).await {
                                 break Outcome::Lost("write".into());
                             }
                         }
@@ -806,7 +890,8 @@ async fn drive(
                                 let _ = send.write_all(&proto::control_frame(&Control::Detach)).await;
                                 let _ = send.finish();
                                 send = s2;
-                                reader = Reader::spawn(sh, r2);
+                                cp = InputCopies::new(&conn, &send);
+                                reader = Reader::spawn(sh, r2, copy_tx.subscribe());
                                 ui.note(format!("qsh → session {}", hello.session), false, 2);
                             }
                             Err(e) => ui.note(format!("qsh: {e:#}"), true, 4),
@@ -852,7 +937,8 @@ async fn drive(
                         && let Ok((s2, r2)) = switch_session(sh, &conn, hello, SessionTarget::Name(next.clone())).await
                     {
                         send = s2;
-                        reader = Reader::spawn(sh, r2);
+                        cp = InputCopies::new(&conn, &send);
+                        reader = Reader::spawn(sh, r2, copy_tx.subscribe());
                         ui.note(format!("qsh · session {ended} ended; now in session {}", hello.session), false, 3);
                         ui.push(&sh.out);
                         continue;
@@ -861,6 +947,7 @@ async fn drive(
                 }
                 break o;
             }
+            _ = copies::sleep_until(cp.sched.next()) => cp.fire(sh),
             Some(mut v) = reader.ack_rx.recv() => {
                 while let Ok(x) = reader.ack_rx.try_recv() {
                     v = x;
@@ -875,6 +962,13 @@ async fn drive(
                 if ok && link.kind == PathKind::Tunnel && link.use_direct().is_ok() {
                     crate::paths::log("UDP works again: connection moved to direct UDP");
                     rebound = false;
+                }
+            }
+            Some(r) = warm_rx.recv() => {
+                warming = false;
+                match r {
+                    Ok(h) => warm = Some((h, Instant::now())),
+                    Err(e) => crate::paths::log(format!("SSH helper in advance: {e:#}")),
                 }
             }
             Some(r) = race_rx.recv() => {
@@ -915,7 +1009,7 @@ async fn drive(
                     };
                     b.extend_from_slice(&u.queued);
                     ui.push(&sh.out);
-                    if !send_input(sh, &mut send, &b).await {
+                    if !send_input(sh, &mut send, &mut cp, &b).await {
                         break Outcome::Lost("write".into());
                     }
                 }
@@ -929,7 +1023,7 @@ async fn drive(
                 ui.tick();
                 let _ = sh.out.try_send(Out::Tick);
                 // The tick period is PING_EVERY (small timer jitter is allowed).
-                if last_ping.elapsed() >= PING_EVERY.mul_f32(0.8) {
+                if last_ping.elapsed() >= ping_every.mul_f32(0.8) {
                     last_ping = Instant::now();
                     seq = seq.wrapping_add(1);
                     let mut d = vec![b'P'];
@@ -968,11 +1062,33 @@ async fn drive(
                     crate::paths::log("no echo for 3s: rebind to a new UDP socket");
                     let _ = link.use_direct();
                 }
-                if idle > Duration::from_secs(3) && !racing && link.spec.is_some() {
+                // At most one SSH login a minute for this; it waits a minute
+                // for use.
+                if idle > Duration::from_millis(1500)
+                    && !warming
+                    && warm.is_none()
+                    && last_warm.elapsed() > Duration::from_secs(60)
+                    && link.kind == PathKind::Direct
+                    && link.transport == Transport::Auto
+                    && !crate::ablate::off("prewarm")
+                    && let Some(spec) = link.spec.clone()
+                {
+                    warming = true;
+                    last_warm = Instant::now();
+                    crate::paths::log(format!("no echo for {idle:?}: SSH helper in advance"));
+                    let tx = warm_tx.clone();
+                    tokio::spawn(async move { let _ = tx.send(net::spawn_helper(&spec, true, false, true).await); });
+                }
+                if warm.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(60)) {
+                    warm = None;
+                }
+                // With the helper ready, a race costs only a handshake: start it sooner.
+                let race_after = if warm.is_some() { Duration::from_secs(2) } else { Duration::from_secs(3) };
+                if idle > race_after && !racing && link.spec.is_some() {
                     // At the same time, make a new connection. The first that works wins.
                     racing = true;
-                    let (rs, tx) = (link.race_spec(), race_tx.clone());
-                    tokio::spawn(async move { let _ = tx.send(net::race(rs, None, Duration::from_millis(300)).await); });
+                    let (rs, tx, h) = (link.race_spec(), race_tx.clone(), warm.take().map(|(h, _)| h));
+                    tokio::spawn(async move { let _ = tx.send(net::race(rs, h, Duration::from_millis(300)).await); });
                 }
                 if idle > Duration::from_secs(10) {
                     break Outcome::Lost("timeout".into());
@@ -995,6 +1111,8 @@ async fn drive(
     reader.task.abort();
     acceptor.abort();
     echo.abort();
+    let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    crate::paths::log(format!("copies: {} sent, {} used (all connections)", n(&copies::SENT), n(&copies::USED)));
     if let Some(u) = upload {
         // The paste (not uploaded) and the keys after it go on the next connection.
         u.task.abort();
@@ -1014,12 +1132,12 @@ struct Reader {
 }
 
 impl Reader {
-    fn spawn(sh: &Arc<Shared>, recv: quinn::RecvStream) -> Reader {
+    fn spawn(sh: &Arc<Shared>, recv: quinn::RecvStream, copies: tokio::sync::broadcast::Receiver<bytes::Bytes>) -> Reader {
         let (net_tx, net_rx) = mpsc::unbounded_channel::<Outcome>();
         let (ack_tx, ack_rx) = mpsc::unbounded_channel::<u64>();
         let sh = sh.clone();
         let task = tokio::spawn(async move {
-            let o = read_loop(&sh, recv, ack_tx).await;
+            let o = read_loop(&sh, recv, copies, ack_tx).await;
             let _ = net_tx.send(o);
         });
         Reader { task, net_rx, ack_rx }
@@ -1117,60 +1235,130 @@ impl ProbeTarget {
     }
 }
 
-async fn read_loop(sh: &Shared, mut recv: quinn::RecvStream, ack: mpsc::UnboundedSender<u64>) -> Outcome {
+type Frame = Result<Option<(u8, Vec<u8>)>>;
+
+/// Reads the frames of a stream (a read is not cancel safe: it runs alone).
+async fn pump_frames(mut recv: quinn::RecvStream, tx: mpsc::Sender<Frame>) {
     loop {
-        let (k, p) = match proto::read_frame(&mut recv).await {
-            Ok(Some(f)) => f,
-            Ok(None) => return Outcome::Lost("stream closed".into()),
-            Err(e) => return Outcome::Lost(e.to_string()),
-        };
-        match k {
-            kind::OUTPUT => {
-                let Ok((off, data)) = proto::split_offset(&p) else { continue };
-                let cur = sh.offset.load(Ordering::SeqCst);
-                let end = off + data.len() as u64;
-                if end <= cur {
-                    continue;
-                }
-                let skip = cur.saturating_sub(off) as usize;
-                crate::paths::dump(false, &data[skip..]);
-                if sh.out.send(Out::Data(data[skip..].to_vec())).await.is_err() {
-                    return Outcome::Quit;
-                }
-                sh.offset.store(end, Ordering::SeqCst);
-                let _ = ack.send(end);
-            }
-            kind::SNAPSHOT => {
-                let Ok((off, data)) = proto::split_offset(&p) else { continue };
-                if sh.out.send(Out::Data(data.to_vec())).await.is_err() {
-                    return Outcome::Quit;
-                }
-                sh.offset.store(off, Ordering::SeqCst);
-                let _ = ack.send(off);
-            }
-            kind::SIZE if p.len() >= 5 => {
-                let v = |i: usize| u16::from_be_bytes([p[i], p[i + 1]]);
-                let mine = p[4] & proto::SIZE_MINE != 0;
-                if sh.out.send(Out::Size { cols: v(0), rows: v(2), mine }).await.is_err() {
-                    return Outcome::Quit;
-                }
-            }
-            kind::INPUT_ACK if p.len() >= 9 => {
-                let n = u64::from_be_bytes(p[..8].try_into().unwrap());
-                sh.input.lock().unwrap().ack(n);
-                if sh.out.send(Out::InputAck { n, mode: p[8] }).await.is_err() {
-                    return Outcome::Quit;
-                }
-            }
-            kind::CONTROL => match serde_json::from_slice::<Control>(&p) {
-                Ok(Control::Exit { code, others }) => return Outcome::Exit(code, others),
-                Ok(Control::Detached { reason }) => return Outcome::Detached(reason),
-                Ok(Control::Notice { text }) => crate::paths::log(format!("notice: {text}")),
-                _ => {}
-            },
-            _ => {}
+        let f = proto::read_frame(&mut recv).await;
+        let more = matches!(f, Ok(Some(_)));
+        if tx.send(f).await.is_err() || !more {
+            return;
         }
     }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Frames from the stream, and copies of small output from datagrams
+/// (`copies`): a copy is used only at its exact place in the stream, and the
+/// stream's frames up to the end of a used copy are skipped.
+async fn read_loop(sh: &Shared, recv: quinn::RecvStream, mut copies: tokio::sync::broadcast::Receiver<bytes::Bytes>, ack: mpsc::UnboundedSender<u64>) -> Outcome {
+    use tokio::sync::broadcast::error::RecvError;
+    let sid = u64::from(recv.id());
+    let (ftx, mut frx) = mpsc::channel::<Frame>(16);
+    let _pump = AbortOnDrop(tokio::spawn(pump_frames(recv, ftx)));
+    // Bytes of the stream read, and bytes of the stream that the terminal has.
+    let (mut pos, mut have) = (0u64, 0u64);
+    let mut open = true;
+    loop {
+        tokio::select! {
+            f = frx.recv() => {
+                let (k, p) = match f {
+                    Some(Ok(Some(f))) => f,
+                    Some(Ok(None)) | None => return Outcome::Lost("stream closed".into()),
+                    Some(Err(e)) => return Outcome::Lost(e.to_string()),
+                };
+                pos += 5 + p.len() as u64;
+                if pos <= have {
+                    continue;
+                }
+                have = pos;
+                if let Some(o) = apply_frame(sh, k, &p, &ack).await {
+                    return o;
+                }
+            }
+            c = copies.recv(), if open => {
+                let d = match c {
+                    Ok(d) => d,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => {
+                        open = false;
+                        continue;
+                    }
+                };
+                let Some((_, s, at, data)) = crate::copies::decode(&d) else { continue };
+                if s != sid || at != have {
+                    continue;
+                }
+                let Some(frames) = crate::copies::frames(data) else { continue };
+                for (k, p) in frames {
+                    if let Some(o) = apply_frame(sh, k, p, &ack).await {
+                        return o;
+                    }
+                }
+                have = at + data.len() as u64;
+                crate::copies::USED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Applies one frame; returns the outcome when the stream's work ends.
+async fn apply_frame(sh: &Shared, k: u8, p: &[u8], ack: &mpsc::UnboundedSender<u64>) -> Option<Outcome> {
+    match k {
+        kind::OUTPUT => {
+            let Ok((off, data)) = proto::split_offset(p) else { return None };
+            let cur = sh.offset.load(Ordering::SeqCst);
+            let end = off + data.len() as u64;
+            if end <= cur {
+                return None;
+            }
+            let skip = cur.saturating_sub(off) as usize;
+            crate::paths::dump(false, &data[skip..]);
+            if sh.out.send(Out::Data(data[skip..].to_vec())).await.is_err() {
+                return Some(Outcome::Quit);
+            }
+            sh.offset.store(end, Ordering::SeqCst);
+            let _ = ack.send(end);
+        }
+        kind::SNAPSHOT => {
+            let Ok((off, data)) = proto::split_offset(p) else { return None };
+            if sh.out.send(Out::Data(data.to_vec())).await.is_err() {
+                return Some(Outcome::Quit);
+            }
+            sh.offset.store(off, Ordering::SeqCst);
+            let _ = ack.send(off);
+        }
+        kind::SIZE if p.len() >= 5 => {
+            let v = |i: usize| u16::from_be_bytes([p[i], p[i + 1]]);
+            let mine = p[4] & proto::SIZE_MINE != 0;
+            if sh.out.send(Out::Size { cols: v(0), rows: v(2), mine }).await.is_err() {
+                return Some(Outcome::Quit);
+            }
+        }
+        kind::INPUT_ACK if p.len() >= 9 => {
+            let n = u64::from_be_bytes(p[..8].try_into().unwrap());
+            sh.input.lock().unwrap().ack(n);
+            if sh.out.send(Out::InputAck { n, mode: p[8] }).await.is_err() {
+                return Some(Outcome::Quit);
+            }
+        }
+        kind::CONTROL => match serde_json::from_slice::<Control>(p) {
+            Ok(Control::Exit { code, others }) => return Some(Outcome::Exit(code, others)),
+            Ok(Control::Detached { reason }) => return Some(Outcome::Detached(reason)),
+            Ok(Control::Notice { text }) => crate::paths::log(format!("notice: {text}")),
+            _ => {}
+        },
+        _ => {}
+    }
+    None
 }
 
 /// An event while disconnected. Keys go into the input log (and show as
@@ -1222,7 +1410,12 @@ async fn reconnect(
         }
         let rs = link.race_spec();
         let fut = async {
-            let cand = net::race_until_up(rs).await;
+            let cand = if crate::ablate::off("reconnect") {
+                // The old way: one race; after a failure, wait and try again.
+                net::race(rs, None, Duration::from_millis(300)).await.map_err(Fail::Retry)?
+            } else {
+                net::race_until_up(rs).await
+            };
             let (s, r, w) = handshake(&cand.conn, &h).await?;
             Ok::<_, Fail>((cand, s, r, w))
         };

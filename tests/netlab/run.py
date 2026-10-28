@@ -57,6 +57,13 @@ PROFILES = {
     "lte": {"delay_ms": 40, "jitter_ms": 20, "loss": 0.03, "burst": 3},
     "bad": {"delay_ms": 80, "jitter_ms": 40, "loss": 0.10, "burst": 4, "reorder": 0.02},
     "awful": {"delay_ms": 150, "jitter_ms": 60, "loss": 0.25, "burst": 5},
+    # Loss in time (radio fades): the same share of loss, but a fade is as
+    # long for a sparse flow as for a dense one.
+    "lte-t": {"delay_ms": 40, "jitter_ms": 20, "loss": 0.03, "burst_ms": 60},
+    "bad-t": {"delay_ms": 80, "jitter_ms": 40, "loss": 0.10, "burst_ms": 150, "reorder": 0.02},
+    "awful-t": {"delay_ms": 150, "jitter_ms": 60, "loss": 0.25, "burst_ms": 300},
+    # Independent loss (a policer, a noisy link).
+    "lossy": {"delay_ms": 40, "jitter_ms": 10, "loss": 0.05},
     "slow": {"delay_ms": 30, "rate_kbit": 1000, "queue_ms": 2000},
     "slow-shallow": {"delay_ms": 30, "rate_kbit": 1000, "queue_ms": 200},
     "dsl": {"delay_ms": 20, "rate_kbit": 10000, "queue_ms": 500},
@@ -66,7 +73,9 @@ PROFILES = {
 L = "/tmp/qshlab"
 SSH = []
 DEST = "root@10.99.0.2"
+PORT = 56901
 RESULTS = []
+EXTRA = []  # more options for qsh clients (ablate.py)
 
 
 def plain(b):
@@ -174,9 +183,10 @@ class Client:
                 if os.path.exists(p):
                     os.remove(p)
             env.update(HOME=f"{L}/chome", QSH_LOG=f"{L}/c.log", QSH_DUMP=self.dump)
-            argv = [f"{L}/qsh", "-s", name, "--port", "56901", "--server", f"{L}/qsh", "--ssh", " ".join(SSH), DEST]
+            argv = [f"{L}/qsh", "-s", name, "--port", str(PORT), "--server", f"{L}/qsh", "--ssh", " ".join(SSH), DEST]
             if kind == "qsh-np":
                 argv[1:1] = ["--predict", "never"]
+            argv[1:1] = EXTRA
         self.t0 = time.monotonic()
         self.term = Term(argv, env)
 
@@ -340,7 +350,7 @@ def t_outage():
             c.start()
             c.term.token = COUNTER
             total = 4 + secs + 10
-            c.term.send(f"(i=0; end=$((SECONDS+{total})); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END) &\r".encode())
+            c.term.send(f"(i=0; end=$((SECONDS+{total})); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END-$((6*7))) &\r".encode())
             c.term.run_for(4)
             set_profile({**base, "blackout": True})
             c.term.run_for(secs / 2)
@@ -354,7 +364,7 @@ def t_outage():
             try:
                 c.term.wait(lambda b: any(n > last for n, _ in c.term.seen), 120)
                 rec = time.monotonic() - back
-                c.term.wait(lambda b: b"QC-END" in b, total + 120)
+                c.term.wait(lambda b: b"QC-END-42" in b, total + 120)
                 c.term.run_for(1)
                 ok, note = check(c.numbers(COUNTER))
                 typed = read_lines(f) == [word]
@@ -370,7 +380,7 @@ def t_udpblock():
     c = Client("qsh", "udpblock")
     c.start()
     c.term.token = COUNTER
-    c.term.send(b"(i=0; end=$((SECONDS+75)); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END) &\r")
+    c.term.send(b"(i=0; end=$((SECONDS+75)); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END-$((6*7))) &\r")
     c.term.run_for(3)
     set_profile({**base, "block_udp": True})
     t0 = time.monotonic()
@@ -389,7 +399,7 @@ def t_udpblock():
             f.seek(log0)
             if re.search(rb"moved to direct UDP|new connection \(Direct\)", f.read()):
                 moved = time.monotonic() - t1
-    c.term.wait(lambda b: b"QC-END" in b, 120)
+    c.term.wait(lambda b: b"QC-END-42" in b, 120)
     c.term.run_for(1)
     ok, note = check(c.numbers(COUNTER))
     report("udpblock", "lte", "qsh", f"{moved:.1f} s" if moved else "no move", ok and moved is not None, "UDP works again: back to UDP; " + note)
@@ -535,7 +545,7 @@ def t_soak(minutes):
     for c in cs.values():
         c.start()
         c.term.token = COUNTER
-        c.term.send(f"(i=0; end=$((SECONDS+{int(minutes * 60) + 5})); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END) &\r".encode())
+        c.term.send(f"(i=0; end=$((SECONDS+{int(minutes * 60) + 5})); while [ $SECONDS -lt $end ]; do i=$((i+1)); echo \"QC$i.\"; sleep 0.05; done; echo QC-END-$((6*7))) &\r".encode())
     words = {k: [] for k in cs}
     events = []
 
@@ -566,7 +576,7 @@ def t_soak(minutes):
     set_profile(PROFILES["lte"])
     for k, c in cs.items():
         try:
-            c.term.wait(lambda b: b"QC-END" in b, 180)
+            c.term.wait(lambda b: b"QC-END-42" in b, 180)
             # Commands can still be on the way (TCP retransmits late after
             # an outage): wait until all are there, at most 60 s.
             end = time.monotonic() + 60
@@ -585,15 +595,18 @@ def t_soak(minutes):
 
 
 def main():
-    global L, SSH
+    global L, SSH, DEST, PORT
     p = argparse.ArgumentParser()
     p.add_argument("--lab", default=L)
+    p.add_argument("--net", type=int, default=99, help="the lab's net (lab.sh QSH_LAB_NET)")
     p.add_argument("--only", default="startup,echo,integrity,typing,outage,udpblock,ctrlc,idle,revoke,soak")
     p.add_argument("--soak", type=float, default=10)
     p.add_argument("--kinds", default="ssh,qsh", help="clients for the tests that compare them")
     a = p.parse_args()
     KINDS[:] = a.kinds.split(",")
     L = a.lab
+    DEST = f"root@10.{a.net}.0.2"
+    PORT = 56802 + a.net
     SSH = ["ssh", "-p", "2222", "-i", f"{L}/key", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
     for f in os.listdir(L):
         if f.startswith("typed-") or f.startswith("dump-"):

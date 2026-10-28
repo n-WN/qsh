@@ -901,6 +901,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "getrandom 0.3.4",
  "hex",

@@ -949,11 +949,10 @@ enum Next {
     Exit(i32),
 }
 
-/// Flow window for one connection: about two congestion windows, so the
-/// network stays busy, but little output waits in buffers.
-/// Output that may wait unacknowledged: two congestion windows. The minimum
-/// is small, because everything in it goes before a Ctrl-C takes effect:
-/// 32 KB is 0.26 s on a 1 Mbit/s link (256 KB was 2 s).
+/// Output that may wait unacknowledged: two congestion windows, so the
+/// network stays busy, but little output waits in buffers. The minimum is
+/// small, because everything in it goes before a Ctrl-C takes effect: 32 KB
+/// is 0.26 s on a 1 Mbit/s link (256 KB was 2 s).
 fn window(conn: &quinn::Connection) -> u64 {
     let min = crate::ablate::value("winmin").unwrap_or(if crate::ablate::off("win32k") { 256 << 10 } else { 32 << 10 });
     (2 * conn.stats().path.cwnd).clamp(min, 4 << 20)
@@ -1004,6 +1003,14 @@ async fn output_loop(d: Arc<Daemon>, sess: Arc<Session>, conn: quinn::Connection
             let skip = skip_at.is_some_and(|t| Instant::now() >= t);
             if skip && let Some(c) = st.clients.get_mut(&id) {
                 c.skip_at = None;
+                let path = conn.stats().path;
+                eprintln!(
+                    "qsh daemon: interrupt: {} bytes not sent, {} in flight, window {win}, cwnd {}, rtt {:?}",
+                    head.saturating_sub(off),
+                    off.saturating_sub(acked),
+                    path.cwnd,
+                    path.rtt
+                );
             }
             let snapshot = match snap.take() {
                 Some(s) => Some(s),

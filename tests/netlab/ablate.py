@@ -250,6 +250,26 @@ EXPS = {
 }
 
 
+# One primary metric for each mechanism, fixed before the results: the
+# summary tests these with a Holm correction over this list only. All other
+# rows are exploratory.
+PRIMARY = {
+    "skip": "ctrlc/slow",
+    "win32k": "ctrlc/slow",
+    "initwin": "ctrlc/slow-fresh",
+    "bbr": "flow/lte",
+    "floor": "startup/awful",
+    "ping4": "idle/awful-t",
+    "knownrtt": "startup/awful-t",
+    "fastretry": "startup/awful-t",
+    "reconnect": "outage/30s",
+    "nofast": "startup/bad",
+    "copies": "echo/awful",
+    "fastrace": "startup/awful",
+    "prewarm": "udpblock/lte",
+}
+
+
 def use_variant(v):
     """Client and lab daemon with this variant; the daemon starts again."""
     off = "" if v in ("base", "nofast") else v.replace("+", ",")
@@ -426,6 +446,30 @@ def summary(path):
         print("| " + " | ".join(str(x) for x in r[:8]) + f" | {ps} | {r[9]} |")
     print(f"\n* significant after Holm correction over {m} comparisons (family error 0.05)")
     print("Last column: samples (fails count as slow) above twice the median of base, with Fisher's exact test.")
+    # The primary metrics, with Holm over these only.
+    prim = []
+    for v, exp in PRIMARY.items():
+        d = data.get(exp, {})
+        if v in d and "base" in d and d[v]["s"] and d["base"]["s"]:
+            # A failure counts as the worst result.
+            worst = 0.0 if exp in EXPS and EXPS[exp][5] else float("inf")
+            xs, bs = d[v]["s"] + [worst] * d[v]["fails"], d["base"]["s"] + [worst] * d["base"]["fails"]
+            prim.append((mann_whitney(xs, bs), v, exp))
+    if prim:
+        ok, m2 = set(), len(prim)
+        for k, (p, v, _) in enumerate(sorted(prim)):
+            if p > 0.05 / (m2 - k):
+                break
+            ok.add(v)
+        print("\nPrimary metrics (Holm over these):\n")
+        print("| Off | Metric | base | off | p | |")
+        print("|---|---|---|---|---|---|")
+        for p, v, exp in prim:
+            unit = EXPS[exp][4] if exp in EXPS else ""
+            b, x = data[exp]["base"], data[exp][v]
+            fb = f" ({b['fails']} failed)" if b["fails"] else ""
+            fx = f" ({x['fails']} failed)" if x["fails"] else ""
+            print(f"| {v} | {exp} | {fmt(quantile(b['s'], 0.5), unit)}{fb} | {fmt(quantile(x['s'], 0.5), unit)}{fx} | {p:.2g} | {'*' if v in ok else ''} |")
 
 
 def main():

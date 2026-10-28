@@ -496,7 +496,8 @@ async fn connect_ssh(opts: &Opts, spec: &SshSpec, hello: &Hello, t0: Instant) ->
     let fp = helper.line.fp.clone();
     let token = helper.line.token.clone().ok_or_else(|| anyhow!("no token from the server"))?;
     let mut link = Link::new(addr, &fp, opts.transport, Some(spec.clone()))?;
-    let cand = net::race(link.race_spec(), want_tunnel.then_some(helper), Duration::ZERO).await?;
+    let from = if want_tunnel { net::HelperFrom::Ready(helper) } else { net::HelperFrom::New(Duration::ZERO) };
+    let cand = net::race(link.race_spec(), from).await?;
     let conn = link.adopt(cand);
     crate::paths::log(format!("startup: QUIC connected ({:?}) {:?}", link.kind, t0.elapsed()));
     if link.kind == PathKind::Tunnel && opts.transport == Transport::Auto {
@@ -782,12 +783,16 @@ async fn drive(
     let mut seq: u32 = 0;
     let mut rebound = false;
     let mut racing = false;
-    // An SSH helper that starts when the echoes stop for a moment: if the path
-    // stays dead (UDP blocked), the tunnel need not wait for an SSH login.
+    // An SSH helper that starts when the path goes silent: if it stays dead
+    // (UDP blocked), the tunnel need not wait for an SSH login.
     let (warm_tx, mut warm_rx) = mpsc::unbounded_channel::<Result<net::Helper>>();
     let mut warm: Option<(net::Helper, Instant)> = None;
     let mut warming = false;
-    let mut last_warm = Instant::now() - Duration::from_secs(120);
+    // A race that started while the helper was starting waits for it.
+    let mut give_race: Option<tokio::sync::oneshot::Sender<net::Helper>> = None;
+    // Any packet from the server: a lossy path still brings some, a dead one none.
+    let mut rx_count = conn.stats().udp_rx.datagrams;
+    let mut last_rx = Instant::now();
     let mut last_probe = Instant::now() - Duration::from_secs(25);
     let mut probing = false;
     let mut predict_sent = (false, u128::MAX);
@@ -967,8 +972,21 @@ async fn drive(
             Some(r) = warm_rx.recv() => {
                 warming = false;
                 match r {
-                    Ok(h) => warm = Some((h, Instant::now())),
-                    Err(e) => crate::paths::log(format!("SSH helper in advance: {e:#}")),
+                    Ok(h) => {
+                        // A waiting race takes it; else it waits here for one.
+                        let h = match give_race.take() {
+                            Some(tx) => tx.send(h).err(),
+                            None => Some(h),
+                        };
+                        if let Some(h) = h {
+                            warm = Some((h, Instant::now()));
+                        }
+                    }
+                    Err(e) => {
+                        // A waiting race starts its own helper.
+                        give_race = None;
+                        crate::paths::log(format!("SSH helper in advance: {e:#}"));
+                    }
                 }
             }
             Some(r) = race_rx.recv() => {
@@ -981,6 +999,9 @@ async fn drive(
                         match handshake(&cand.conn, &h).await {
                             Ok((s2, r2, w)) => {
                                 crate::paths::log(format!("moved to a new connection ({:?}) at offset {}", cand.kind, h.offset));
+                                if cand.kind == PathKind::Tunnel {
+                                    link.warm_wait = net::WARM_WAIT;
+                                }
                                 let c2 = link.adopt(cand);
                                 ui.badge(None);
                                 ui.note(format!("qsh ✓ back · {}", link.path_name()), false, 2);
@@ -1062,19 +1083,31 @@ async fn drive(
                     crate::paths::log("no echo for 3s: rebind to a new UDP socket");
                     let _ = link.use_direct();
                 }
-                // At most one SSH login a minute for this; it waits a minute
-                // for use.
+                let rx = conn.stats().udp_rx.datagrams;
+                if rx != rx_count {
+                    rx_count = rx;
+                    last_rx = Instant::now();
+                }
+                let silent = last_rx.elapsed() > Duration::from_millis(1500);
+                // At most one SSH login a minute for this, and the wait doubles
+                // (up to 16 minutes) until a move to the tunnel: a lossy link
+                // that is silent at times soon makes none. A helper waits a
+                // minute for use.
                 if idle > Duration::from_millis(1500)
+                    && silent
                     && !warming
                     && warm.is_none()
-                    && last_warm.elapsed() > Duration::from_secs(60)
+                    && link.warmed.is_none_or(|t| t.elapsed() > link.warm_wait)
                     && link.kind == PathKind::Direct
                     && link.transport == Transport::Auto
                     && !crate::ablate::off("prewarm")
                     && let Some(spec) = link.spec.clone()
                 {
                     warming = true;
-                    last_warm = Instant::now();
+                    if link.warmed.is_some() {
+                        link.warm_wait = (link.warm_wait * 2).min(Duration::from_secs(960));
+                    }
+                    link.warmed = Some(Instant::now());
                     crate::paths::log(format!("no echo for {idle:?}: SSH helper in advance"));
                     let tx = warm_tx.clone();
                     tokio::spawn(async move { let _ = tx.send(net::spawn_helper(&spec, true, false, true).await); });
@@ -1082,13 +1115,23 @@ async fn drive(
                 if warm.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(60)) {
                     warm = None;
                 }
-                // With the helper ready, a race costs only a handshake: start it sooner.
-                let race_after = if warm.is_some() { Duration::from_secs(2) } else { Duration::from_secs(3) };
+                // With the helper ready and nothing from the server, a race costs
+                // only a handshake: start it sooner.
+                let race_after = if warm.is_some() && silent { Duration::from_secs(2) } else { Duration::from_secs(3) };
                 if idle > race_after && !racing && link.spec.is_some() {
                     // At the same time, make a new connection. The first that works wins.
                     racing = true;
-                    let (rs, tx, h) = (link.race_spec(), race_tx.clone(), warm.take().map(|(h, _)| h));
-                    tokio::spawn(async move { let _ = tx.send(net::race(rs, h, Duration::from_millis(300)).await); });
+                    let from = if let Some((h, _)) = warm.take() {
+                        net::HelperFrom::Ready(h)
+                    } else if warming {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        give_race = Some(tx);
+                        net::HelperFrom::Coming(rx)
+                    } else {
+                        net::HelperFrom::New(Duration::from_millis(300))
+                    };
+                    let (rs, tx) = (link.race_spec(), race_tx.clone());
+                    tokio::spawn(async move { let _ = tx.send(net::race(rs, from).await); });
                 }
                 if idle > Duration::from_secs(10) {
                     break Outcome::Lost("timeout".into());
@@ -1412,7 +1455,7 @@ async fn reconnect(
         let fut = async {
             let cand = if crate::ablate::off("reconnect") {
                 // The old way: one race; after a failure, wait and try again.
-                net::race(rs, None, Duration::from_millis(300)).await.map_err(Fail::Retry)?
+                net::race(rs, net::HelperFrom::New(Duration::from_millis(300))).await.map_err(Fail::Retry)?
             } else {
                 net::race_until_up(rs).await
             };

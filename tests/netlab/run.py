@@ -190,8 +190,18 @@ class Client:
         self.t0 = time.monotonic()
         self.term = Term(argv, env)
 
+    def session_text(self):
+        """qsh: the session stream that the client got (no overlay)."""
+        try:
+            with open(self.dump, "rb") as f:
+                return f.read()[-4096:]
+        except FileNotFoundError:
+            return b""
+
     def start(self, timeout=120):
-        self.term.wait(at_prompt, timeout)
+        # The overlay (a badge, a note) can come after the prompt on the
+        # screen; the session stream of qsh has no overlay.
+        self.term.wait(lambda b: at_prompt(b) or (self.kind != "ssh" and at_prompt(self.session_text())), timeout)
         dt = time.monotonic() - self.t0
         self.term.run_for(0.3)
         return dt
@@ -325,7 +335,12 @@ def t_typing():
         set_profile(PROFILES[prof])
         for kind in KINDS:
             c = Client(kind, f"typing-{prof}")
-            c.start()
+            try:
+                c.start()
+            except (TimeoutError, EOFError) as e:
+                report("typing", prof, kind, "no start", False, str(e)[-100:])
+                c.stop()
+                continue
             good = 0
             for i in range(3):
                 word = rand_word(300)

@@ -330,6 +330,9 @@ pub enum PathKind {
     Tunnel,
 }
 
+/// The shortest wait between two SSH helpers in advance.
+pub const WARM_WAIT: Duration = Duration::from_secs(60);
+
 pub struct Link {
     pub ep: quinn::Endpoint,
     pub addr: SocketAddr,
@@ -340,6 +343,10 @@ pub struct Link {
     tunnel: Option<Helper>,
     /// The last round-trip time of the session (for new handshakes).
     pub rtt: Duration,
+    /// When an SSH helper last started in advance, and the wait before the
+    /// next one (over all connections of this client).
+    pub warmed: Option<std::time::Instant>,
+    pub warm_wait: Duration,
 }
 
 /// What a path race needs.
@@ -390,23 +397,35 @@ async fn handshake_on(ep: quinn::Endpoint, addr: SocketAddr, timeout: Duration) 
     Ok((ep, conn))
 }
 
+/// Where the SSH tunnel of a race gets its helper.
+pub enum HelperFrom {
+    Ready(Helper),
+    /// A helper that is starting (in advance). If it fails, a new one starts.
+    Coming(tokio::sync::oneshot::Receiver<Helper>),
+    /// A new helper, after this time.
+    New(Duration),
+}
+
 /// Make a QUIC connection on direct UDP and through the SSH channel at the same
 /// time; the first handshake wins. UDP is preferred: when the tunnel wins, UDP
-/// gets 150 ms more. `helper` is a running tunnel helper, if there is one;
-/// otherwise a new helper starts after `tunnel_delay`.
-pub async fn race(rs: RaceSpec, helper: Option<Helper>, tunnel_delay: Duration) -> Result<Candidate> {
+/// gets 150 ms more.
+pub async fn race(rs: RaceSpec, helper: HelperFrom) -> Result<Candidate> {
     let direct = async {
         let ep = udp_endpoint(&rs.addr, &rs.fp)?;
         let (ep, conn) = handshake_on(ep, rs.addr, Duration::from_secs(5)).await?;
         Ok::<_, anyhow::Error>(Candidate { ep, conn, kind: PathKind::Direct, helper: None })
     };
     let tunnel = async {
+        let spec = rs.spec.as_ref().ok_or_else(|| anyhow!("no ssh"));
         let mut h = match helper {
-            Some(h) => h,
-            None => {
-                tokio::time::sleep(tunnel_delay).await;
-                let spec = rs.spec.as_ref().ok_or_else(|| anyhow!("no ssh"))?;
-                spawn_helper(spec, true, false, true).await?
+            HelperFrom::Ready(h) => h,
+            HelperFrom::Coming(rx) => match rx.await {
+                Ok(h) => h,
+                Err(_) => spawn_helper(spec?, true, false, true).await?,
+            },
+            HelperFrom::New(delay) => {
+                tokio::time::sleep(delay).await;
+                spawn_helper(spec?, true, false, true).await?
             }
         };
         let ep = tunnel_endpoint(&mut h, &rs.addr, &rs.fp)?;
@@ -541,7 +560,7 @@ fn bind_any(addr: &SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 impl Link {
     pub fn new(addr: SocketAddr, fp: &str, transport: Transport, spec: Option<SshSpec>) -> Result<Link> {
         let ep = udp_endpoint(&addr, fp)?;
-        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, fp: fp.to_string(), tunnel: None, rtt: Duration::from_millis(150) })
+        Ok(Link { ep, addr, kind: PathKind::Direct, transport, spec, fp: fp.to_string(), tunnel: None, rtt: Duration::from_millis(150), warmed: None, warm_wait: WARM_WAIT })
     }
 
     /// Use the connection of a race winner (and its endpoint and tunnel).
